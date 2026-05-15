@@ -10,6 +10,112 @@ const GOOGLE_DOCS_API = 'https://docs.googleapis.com/v1/documents';
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
 
 /**
+ * Error thrown by Google API helpers. Carries enough structured detail
+ * (status, Google's `error.status` enum, retry-after) for callers to surface
+ * machine-readable error envelopes instead of opaque strings.
+ */
+class GoogleApiError extends Error {
+  status: number;
+  code?: string;
+  retryAfter?: number;
+  api: 'drive' | 'docs';
+
+  constructor(message: string, status: number, api: 'drive' | 'docs', opts: { code?: string; retryAfter?: number } = {}) {
+    super(message);
+    this.name = 'GoogleApiError';
+    this.status = status;
+    this.api = api;
+    this.code = opts.code;
+    this.retryAfter = opts.retryAfter;
+  }
+}
+
+function safeJsonParse(text: string): any | null {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Parse a non-OK Google API response into a `GoogleApiError`.
+ *
+ * Note: Google's Drive/Docs APIs return 404 for both "doesn't exist" and
+ * "you don't have access" — we surface a disambiguated message so callers
+ * don't make wrong assumptions.
+ */
+async function buildGoogleApiError(
+  response: Response,
+  api: 'drive' | 'docs'
+): Promise<GoogleApiError> {
+  const errorText = await response.text().catch(() => '');
+  const errorJson = errorText ? safeJsonParse(errorText) : null;
+  const googleMessage: string | undefined = errorJson?.error?.message;
+  const googleCode: string | undefined = errorJson?.error?.status;
+
+  let message: string;
+  switch (response.status) {
+    case 401:
+      message = 'Authentication failed. Please re-authenticate.';
+      break;
+    case 403:
+      message = googleMessage
+        ? `Permission denied: ${googleMessage}`
+        : `Permission denied. Make sure you have granted ${api === 'docs' ? 'Docs' : 'Drive'} access.`;
+      break;
+    case 404:
+      message = api === 'docs'
+        ? 'Document not found or you do not have permission to access it'
+        : 'File or document not found or you do not have permission to access it';
+      break;
+    case 429:
+      message = googleMessage || 'Rate limit exceeded. Retry after a short delay.';
+      break;
+    default:
+      message = googleMessage || errorText || `Google ${api === 'docs' ? 'Docs' : 'Drive'} API error (${response.status})`;
+  }
+
+  let retryAfter: number | undefined;
+  if (response.status === 429 || response.status === 503) {
+    const header = response.headers.get('retry-after');
+    if (header) {
+      const parsed = parseInt(header, 10);
+      if (!Number.isNaN(parsed) && parsed >= 0) retryAfter = parsed;
+    }
+  }
+
+  return new GoogleApiError(message, response.status, api, { code: googleCode, retryAfter });
+}
+
+/**
+ * Format any thrown error into a structured MCP error response. Handlers MUST
+ * wrap their bodies in try/catch and route caught errors through this so
+ * downstream callers get machine-readable `{error, status, code, retryAfter}`
+ * envelopes rather than plain strings.
+ */
+function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text: string }>; isError: true } {
+  let payload: Record<string, unknown>;
+  if (err instanceof GoogleApiError) {
+    payload = {
+      error: err.message,
+      status: err.status,
+      code: err.code,
+      ...(err.retryAfter !== undefined ? { retryAfter: err.retryAfter } : {}),
+      api: err.api,
+    };
+  } else if (err instanceof Error) {
+    payload = { error: err.message };
+  } else {
+    payload = { error: String(err) };
+  }
+  return {
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    isError: true,
+  };
+}
+
+/**
  * Helper to make authenticated requests to Google Drive API
  */
 async function makeDriveRequest(
@@ -29,27 +135,7 @@ async function makeDriveRequest(
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    let errorMessage = `Google Drive API error (${response.status})`;
-
-    try {
-      const errorJson = JSON.parse(errorText);
-      if (errorJson.error?.message) {
-        errorMessage = errorJson.error.message;
-      }
-    } catch {
-      errorMessage = errorText || errorMessage;
-    }
-
-    if (response.status === 404) {
-      throw new Error('File or document not found');
-    } else if (response.status === 403) {
-      throw new Error('Permission denied. Make sure you have granted access.');
-    } else if (response.status === 401) {
-      throw new Error('Authentication failed. Please re-authenticate.');
-    }
-
-    throw new Error(errorMessage);
+    throw await buildGoogleApiError(response, 'drive');
   }
 
   return response.json();
@@ -76,27 +162,7 @@ async function makeDocsRequest(
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    let errorMessage = `Google Docs API error (${response.status})`;
-
-    try {
-      const errorJson = JSON.parse(errorText);
-      if (errorJson.error?.message) {
-        errorMessage = errorJson.error.message;
-      }
-    } catch {
-      errorMessage = errorText || errorMessage;
-    }
-
-    if (response.status === 404) {
-      throw new Error('Document not found');
-    } else if (response.status === 403) {
-      throw new Error('Permission denied. Make sure you have granted Docs access.');
-    } else if (response.status === 401) {
-      throw new Error('Authentication failed. Please re-authenticate.');
-    }
-
-    throw new Error(errorMessage);
+    throw await buildGoogleApiError(response, 'docs');
   }
 
   return response.json();
@@ -558,42 +624,46 @@ export class GoogleDocsTools {
           page_token: z.string().optional().describe('Token for fetching the next page of results'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ name, page_token }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          let q = `mimeType = 'application/vnd.google-apps.document'`;
-          if (name) {
-            q += ` and name contains '${name.replace(/'/g, "\\'")}'`;
+            let q = `mimeType = 'application/vnd.google-apps.document'`;
+            if (name) {
+              q += ` and name contains '${name.replace(/'/g, "\\'")}'`;
+            }
+            q += ` and trashed = false`;
+
+            const params = new URLSearchParams({
+              pageSize: '20',
+              fields: 'nextPageToken,files(id,name,createdTime,modifiedTime,webViewLink,owners)',
+              supportsAllDrives: 'true',
+              includeItemsFromAllDrives: 'true',
+              q,
+              ...(page_token && { pageToken: page_token }),
+            });
+
+            const result = await makeDriveRequest(`/files?${params}`, accessToken);
+
+            const documents = (result.files || []).map((file: any) => ({
+              id: file.id,
+              name: file.name,
+              createdTime: file.createdTime,
+              modifiedTime: file.modifiedTime,
+              webViewLink: file.webViewLink,
+              owner: file.owners?.[0]?.emailAddress,
+            }));
+
+            const output = {
+              documents,
+              nextPageToken: result.nextPageToken || null,
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
           }
-          q += ` and trashed = false`;
-
-          const params = new URLSearchParams({
-            pageSize: '20',
-            fields: 'nextPageToken,files(id,name,createdTime,modifiedTime,webViewLink,owners)',
-            supportsAllDrives: 'true',
-            includeItemsFromAllDrives: 'true',
-            q,
-            ...(page_token && { pageToken: page_token }),
-          });
-
-          const result = await makeDriveRequest(`/files?${params}`, accessToken);
-
-          const documents = (result.files || []).map((file: any) => ({
-            id: file.id,
-            name: file.name,
-            createdTime: file.createdTime,
-            modifiedTime: file.modifiedTime,
-            webViewLink: file.webViewLink,
-            owner: file.owners?.[0]?.emailAddress,
-          }));
-
-          const output = {
-            documents,
-            nextPageToken: result.nextPageToken || null,
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
         }),
       },
 
@@ -614,60 +684,60 @@ export class GoogleDocsTools {
           include_comments: z.boolean().optional().describe('Include comment thread metadata (author email/name, timestamp, replies, resolved status, emoji reactions). `content` is returned verbatim — no inline markers are inserted. Each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchor deleted by later edits) omit `anchor_offset`.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ document_id, include_structure, include_comments }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          // Get file metadata for title and link
-          const metadata = await makeDriveRequest(
-            `/files/${encodeURIComponent(document_id)}?fields=name,webViewLink&supportsAllDrives=true`,
-            accessToken
-          );
+            // Get file metadata for title and link
+            const metadata = await makeDriveRequest(
+              `/files/${encodeURIComponent(document_id)}?fields=name,webViewLink&supportsAllDrives=true`,
+              accessToken
+            );
 
-          // Export document as plain text via Drive API.
-          // Accept-Language pins the export footer (where comment reactions
-          // surface as "X reacted with Y at Z") to the English template the
-          // reaction parser expects.
-          const exportUrl = `${GOOGLE_DRIVE_API}/files/${encodeURIComponent(document_id)}/export?mimeType=text/plain`;
-          const response = await fetch(exportUrl, {
-            headers: {
-              'Authorization': `Bearer ${accessToken}`,
-              'Accept-Language': 'en-US',
-            },
-          });
+            // Export document as plain text via Drive API.
+            // Accept-Language pins the export footer (where comment reactions
+            // surface as "X reacted with Y at Z") to the English template the
+            // reaction parser expects.
+            const exportUrl = `${GOOGLE_DRIVE_API}/files/${encodeURIComponent(document_id)}/export?mimeType=text/plain`;
+            const response = await fetch(exportUrl, {
+              headers: {
+                'Authorization': `Bearer ${accessToken}`,
+                'Accept-Language': 'en-US',
+              },
+            });
 
-          if (!response.ok) {
-            const errorText = await response.text();
-            if (response.status === 404) {
-              throw new Error('Document not found');
+            if (!response.ok) {
+              throw await buildGoogleApiError(response, 'drive');
             }
-            throw new Error(`Failed to export document: ${response.status} - ${errorText}`);
+
+            let content = await response.text();
+
+            const output: any = {
+              id: document_id,
+              title: metadata.name,
+              webViewLink: metadata.webViewLink,
+            };
+
+            if (include_comments) {
+              const { cleanedContent, threads } = await processCommentsForDocument(document_id, accessToken, content);
+              content = cleanedContent;
+              output.threads = threads;
+            }
+
+            output.content = content;
+
+            // If structure requested, also fetch from Docs API
+            if (include_structure) {
+              const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
+              output.structure = parseDocumentStructure(doc.body?.content || []);
+            }
+
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
           }
-
-          let content = await response.text();
-
-          const output: any = {
-            id: document_id,
-            title: metadata.name,
-            webViewLink: metadata.webViewLink,
-          };
-
-          if (include_comments) {
-            const { cleanedContent, threads } = await processCommentsForDocument(document_id, accessToken, content);
-            content = cleanedContent;
-            output.threads = threads;
-          }
-
-          output.content = content;
-
-          // If structure requested, also fetch from Docs API
-          if (include_structure) {
-            const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
-            output.structure = parseDocumentStructure(doc.body?.content || []);
-          }
-
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
         }),
       },
 
@@ -685,54 +755,78 @@ export class GoogleDocsTools {
           parent_folder_id: z.string().optional().describe('ID of the folder to create the document in (supports shared drive folders)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ title, body, parent_folder_id }: any, context: any) => {
-          const { accessToken } = context;
+          let file: { id: string; name: string } | undefined;
+          try {
+            const { accessToken } = context;
 
-          // Create the document via Drive API so we can specify parent folder
-          const fileMetadata: any = {
-            name: title,
-            mimeType: 'application/vnd.google-apps.document',
-          };
-          if (parent_folder_id) {
-            fileMetadata.parents = [parent_folder_id];
-          }
-
-          const file = await makeDriveRequest(
-            `/files?supportsAllDrives=true`,
-            accessToken,
-            {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(fileMetadata),
+            // Create the document via Drive API so we can specify parent folder
+            const fileMetadata: any = {
+              name: title,
+              mimeType: 'application/vnd.google-apps.document',
+            };
+            if (parent_folder_id) {
+              fileMetadata.parents = [parent_folder_id];
             }
-          ) as { id: string; name: string };
 
-          // If body text provided, insert it via Docs API
-          if (body) {
-            await makeDocsRequest(`/${file.id}:batchUpdate`, accessToken, {
-              method: 'POST',
-              body: JSON.stringify({
-                requests: [{
-                  insertText: {
-                    location: { index: 1 },
-                    text: body,
-                  },
-                }],
-              }),
-            });
+            file = await makeDriveRequest(
+              `/files?supportsAllDrives=true`,
+              accessToken,
+              {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(fileMetadata),
+              }
+            ) as { id: string; name: string };
+
+            // If body text provided, insert it via Docs API.
+            // The Drive file has been created at this point — if this fails the
+            // empty document still exists, so surface partialSuccess so the
+            // caller can find it or clean up rather than re-creating.
+            if (body) {
+              try {
+                await makeDocsRequest(`/${encodeURIComponent(file.id)}:batchUpdate`, accessToken, {
+                  method: 'POST',
+                  body: JSON.stringify({
+                    requests: [{
+                      insertText: {
+                        location: { index: 1 },
+                        text: body,
+                      },
+                    }],
+                  }),
+                });
+              } catch (insertErr) {
+                const base = toolErrorResponse(insertErr);
+                const parsed = safeJsonParse(base.content[0].text) || {};
+                const payload = {
+                  ...parsed,
+                  error: `Document was created but inserting body text failed: ${parsed.error ?? String(insertErr)}`,
+                  partialSuccess: true,
+                  fileId: file.id,
+                  webViewLink: `https://docs.google.com/document/d/${file.id}`,
+                };
+                return {
+                  content: [{ type: 'text', text: JSON.stringify(payload) }],
+                  isError: true,
+                };
+              }
+            }
+
+            const webViewLink = `https://docs.google.com/document/d/${file.id}`;
+
+            const output = {
+              id: file.id,
+              title: file.name,
+              webViewLink,
+              message: 'Document created successfully',
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
           }
-
-          const webViewLink = `https://docs.google.com/document/d/${file.id}`;
-
-          const output = {
-            id: file.id,
-            title: file.name,
-            webViewLink,
-            message: 'Document created successfully',
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
         }),
       },
 
@@ -748,37 +842,41 @@ export class GoogleDocsTools {
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from preceding text on the newly appended content. Defaults to true.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, clear_inherited_formatting }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          // Get document to find the end index
-          const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' }) as { body: { content: Array<{ endIndex: number }> } };
-          const endIndex = doc.body.content[doc.body.content.length - 1].endIndex - 1;
+            // Get document to find the end index
+            const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' }) as { body: { content: Array<{ endIndex: number }> } };
+            const endIndex = doc.body.content[doc.body.content.length - 1].endIndex - 1;
 
-          // Insert text at the end, optionally clearing inherited formatting
-          const requests: any[] = [{
-            insertText: {
-              location: { index: endIndex },
-              text,
-            },
-          }];
+            // Insert text at the end, optionally clearing inherited formatting
+            const requests: any[] = [{
+              insertText: {
+                location: { index: endIndex },
+                text,
+              },
+            }];
 
-          if (clear_inherited_formatting !== false) {
-            requests.push(clearInheritedFormattingRequest(endIndex, endIndex + text.length));
+            if (clear_inherited_formatting !== false) {
+              requests.push(clearInheritedFormattingRequest(endIndex, endIndex + text.length));
+            }
+
+            await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+              method: 'POST',
+              body: JSON.stringify({ requests }),
+            });
+
+            const output = {
+              id: document_id,
+              message: 'Text appended successfully',
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
           }
-
-          await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-            method: 'POST',
-            body: JSON.stringify({ requests }),
-          });
-
-          const output = {
-            id: document_id,
-            message: 'Text appended successfully',
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
         }),
       },
 
@@ -796,36 +894,40 @@ export class GoogleDocsTools {
           match_case: z.boolean().optional().describe('Whether to match case (default true)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, old_text, new_text, match_case }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          const result = await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-            method: 'POST',
-            body: JSON.stringify({
-              requests: [{
-                replaceAllText: {
-                  replaceText: new_text,
-                  containsText: {
-                    text: old_text,
-                    matchCase: match_case !== false,
+            const result = await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+              method: 'POST',
+              body: JSON.stringify({
+                requests: [{
+                  replaceAllText: {
+                    replaceText: new_text,
+                    containsText: {
+                      text: old_text,
+                      matchCase: match_case !== false,
+                    },
                   },
-                },
-              }],
-            }),
-          }) as { replies: Array<{ replaceAllText?: { occurrencesChanged: number } }> };
+                }],
+              }),
+            }) as { replies: Array<{ replaceAllText?: { occurrencesChanged: number } }> };
 
-          const occurrencesChanged = result.replies?.[0]?.replaceAllText?.occurrencesChanged || 0;
+            const occurrencesChanged = result.replies?.[0]?.replaceAllText?.occurrencesChanged || 0;
 
-          const output = {
-            id: document_id,
-            occurrencesChanged,
-            message: occurrencesChanged > 0
-              ? `Replaced ${occurrencesChanged} occurrence(s)`
-              : 'No occurrences found',
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
+            const output = {
+              id: document_id,
+              occurrencesChanged,
+              message: occurrencesChanged > 0
+                ? `Replaced ${occurrencesChanged} occurrence(s)`
+                : 'No occurrences found',
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
+          }
         }),
       },
 
@@ -842,31 +944,35 @@ export class GoogleDocsTools {
           endIndex: z.coerce.number().int().describe('End index of content to delete (exclusive)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-            method: 'POST',
-            body: JSON.stringify({
-              requests: [{
-                deleteContentRange: {
-                  range: {
-                    startIndex,
-                    endIndex,
-                    segmentId: '',
+            await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+              method: 'POST',
+              body: JSON.stringify({
+                requests: [{
+                  deleteContentRange: {
+                    range: {
+                      startIndex,
+                      endIndex,
+                      segmentId: '',
+                    },
                   },
-                },
-              }],
-            }),
-          });
+                }],
+              }),
+            });
 
-          const output = {
-            id: document_id,
-            message: `Deleted content from index ${startIndex} to ${endIndex}`,
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
+            const output = {
+              id: document_id,
+              message: `Deleted content from index ${startIndex} to ${endIndex}`,
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
+          }
         }),
       },
 
@@ -883,32 +989,36 @@ export class GoogleDocsTools {
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from surrounding text on the newly inserted content. Defaults to false.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, index, clear_inherited_formatting }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          const requests: any[] = [{
-            insertText: {
-              location: { index },
-              text,
-            },
-          }];
+            const requests: any[] = [{
+              insertText: {
+                location: { index },
+                text,
+              },
+            }];
 
-          if (clear_inherited_formatting === true) {
-            requests.push(clearInheritedFormattingRequest(index, index + text.length));
+            if (clear_inherited_formatting === true) {
+              requests.push(clearInheritedFormattingRequest(index, index + text.length));
+            }
+
+            await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+              method: 'POST',
+              body: JSON.stringify({ requests }),
+            });
+
+            const output = {
+              id: document_id,
+              message: `Text inserted at index ${index}`,
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
           }
-
-          await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-            method: 'POST',
-            body: JSON.stringify({ requests }),
-          });
-
-          const output = {
-            id: document_id,
-            message: `Text inserted at index ${index}`,
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
         }),
       },
 
@@ -929,58 +1039,67 @@ export class GoogleDocsTools {
           link_url: z.string().optional().describe('Set hyperlink URL'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, bold, italic, underline, strikethrough, link_url }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          // Build textStyle and fields dynamically from provided params
-          const textStyle: any = {};
-          const fields: string[] = [];
+            // Build textStyle and fields dynamically from provided params
+            const textStyle: any = {};
+            const fields: string[] = [];
 
-          if (bold !== undefined) {
-            textStyle.bold = bold;
-            fields.push('bold');
-          }
-          if (italic !== undefined) {
-            textStyle.italic = italic;
-            fields.push('italic');
-          }
-          if (underline !== undefined) {
-            textStyle.underline = underline;
-            fields.push('underline');
-          }
-          if (strikethrough !== undefined) {
-            textStyle.strikethrough = strikethrough;
-            fields.push('strikethrough');
-          }
-          if (link_url !== undefined) {
-            textStyle.link = { url: link_url };
-            fields.push('link');
-          }
+            if (bold !== undefined) {
+              textStyle.bold = bold;
+              fields.push('bold');
+            }
+            if (italic !== undefined) {
+              textStyle.italic = italic;
+              fields.push('italic');
+            }
+            if (underline !== undefined) {
+              textStyle.underline = underline;
+              fields.push('underline');
+            }
+            if (strikethrough !== undefined) {
+              textStyle.strikethrough = strikethrough;
+              fields.push('strikethrough');
+            }
+            if (link_url !== undefined) {
+              // Empty string => remove the link, otherwise set it.
+              if (link_url === '') {
+                textStyle.link = null;
+              } else {
+                textStyle.link = { url: link_url };
+              }
+              fields.push('link');
+            }
 
-          if (fields.length === 0) {
-            throw new Error('At least one style property must be provided (bold, italic, underline, strikethrough, link_url)');
+            if (fields.length === 0) {
+              throw new Error('At least one style property must be provided (bold, italic, underline, strikethrough, link_url)');
+            }
+
+            await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+              method: 'POST',
+              body: JSON.stringify({
+                requests: [{
+                  updateTextStyle: {
+                    range: { startIndex, endIndex },
+                    textStyle,
+                    fields: fields.join(','),
+                  },
+                }],
+              }),
+            });
+
+            const output = {
+              id: document_id,
+              message: `Applied text style (${fields.join(', ')}) to range ${startIndex}-${endIndex}`,
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
           }
-
-          await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-            method: 'POST',
-            body: JSON.stringify({
-              requests: [{
-                updateTextStyle: {
-                  range: { startIndex, endIndex },
-                  textStyle,
-                  fields: fields.join(','),
-                },
-              }],
-            }),
-          });
-
-          const output = {
-            id: document_id,
-            message: `Applied text style (${fields.join(', ')}) to range ${startIndex}-${endIndex}`,
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
         }),
       },
 
@@ -998,59 +1117,63 @@ export class GoogleDocsTools {
           alignment: z.enum(['START', 'CENTER', 'END', 'JUSTIFIED']).optional().describe('Paragraph alignment'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, heading_level, alignment }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          const paragraphStyle: any = {};
-          const fields: string[] = [];
+            const paragraphStyle: any = {};
+            const fields: string[] = [];
 
-          if (heading_level !== undefined) {
-            const headingMap: Record<number, string> = {
-              0: 'NORMAL_TEXT',
-              1: 'HEADING_1',
-              2: 'HEADING_2',
-              3: 'HEADING_3',
-              4: 'HEADING_4',
-              5: 'HEADING_5',
-              6: 'HEADING_6',
-            };
-            const namedStyle = headingMap[heading_level];
-            if (!namedStyle) {
-              throw new Error('heading_level must be 0 (normal) or 1-6');
+            if (heading_level !== undefined) {
+              const headingMap: Record<number, string> = {
+                0: 'NORMAL_TEXT',
+                1: 'HEADING_1',
+                2: 'HEADING_2',
+                3: 'HEADING_3',
+                4: 'HEADING_4',
+                5: 'HEADING_5',
+                6: 'HEADING_6',
+              };
+              const namedStyle = headingMap[heading_level];
+              if (!namedStyle) {
+                throw new Error('heading_level must be 0 (normal) or 1-6');
+              }
+              paragraphStyle.namedStyleType = namedStyle;
+              fields.push('namedStyleType');
             }
-            paragraphStyle.namedStyleType = namedStyle;
-            fields.push('namedStyleType');
+
+            if (alignment !== undefined) {
+              paragraphStyle.alignment = alignment;
+              fields.push('alignment');
+            }
+
+            if (fields.length === 0) {
+              throw new Error('At least one style property must be provided (heading_level, alignment)');
+            }
+
+            await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+              method: 'POST',
+              body: JSON.stringify({
+                requests: [{
+                  updateParagraphStyle: {
+                    range: { startIndex, endIndex },
+                    paragraphStyle,
+                    fields: fields.join(','),
+                  },
+                }],
+              }),
+            });
+
+            const output = {
+              id: document_id,
+              message: `Applied paragraph style (${fields.join(', ')}) to range ${startIndex}-${endIndex}`,
+            };
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
           }
-
-          if (alignment !== undefined) {
-            paragraphStyle.alignment = alignment;
-            fields.push('alignment');
-          }
-
-          if (fields.length === 0) {
-            throw new Error('At least one style property must be provided (heading_level, alignment)');
-          }
-
-          await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-            method: 'POST',
-            body: JSON.stringify({
-              requests: [{
-                updateParagraphStyle: {
-                  range: { startIndex, endIndex },
-                  paragraphStyle,
-                  fields: fields.join(','),
-                },
-              }],
-            }),
-          });
-
-          const output = {
-            id: document_id,
-            message: `Applied paragraph style (${fields.join(', ')}) to range ${startIndex}-${endIndex}`,
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
         }),
       },
 
@@ -1061,6 +1184,7 @@ export class GoogleDocsTools {
           rows: z.number(),
           columns: z.number(),
           message: z.string(),
+          warning: z.string().optional(),
         },
         schema: {
           document_id: z.string().describe('Google Doc ID'),
@@ -1068,74 +1192,95 @@ export class GoogleDocsTools {
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting on the newly appended table content. Defaults to true.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, rows, clear_inherited_formatting }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          if (!rows || rows.length === 0) {
-            throw new Error('Table must have at least one row');
-          }
-
-          // Normalize ragged rows: find max columns and pad shorter rows
-          const tableData: string[][] = rows.map((row: string[]) => [...row]);
-          let maxCols = 0;
-          for (const row of tableData) {
-            maxCols = Math.max(maxCols, row.length);
-          }
-          if (maxCols === 0) {
-            throw new Error('Table must have at least one column');
-          }
-          for (const row of tableData) {
-            while (row.length < maxCols) {
-              row.push('');
+            if (!rows || rows.length === 0) {
+              throw new Error('Table must have at least one row');
             }
-          }
 
-          // Get document to find the end index
-          const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' }) as { body: { content: Array<{ endIndex: number }> } };
-          const endOfDoc = doc.body.content[doc.body.content.length - 1].endIndex;
-          const insertIndex = Math.max(1, endOfDoc - 1);
+            // Normalize ragged rows: find max columns and pad shorter rows
+            const tableData: string[][] = rows.map((row: string[]) => [...row]);
+            let maxCols = 0;
+            for (const row of tableData) {
+              maxCols = Math.max(maxCols, row.length);
+            }
+            if (maxCols === 0) {
+              throw new Error('Table must have at least one column');
+            }
+            for (const row of tableData) {
+              while (row.length < maxCols) {
+                row.push('');
+              }
+            }
 
-          // Build requests: first insert empty table, then populate cells in reverse order
-          const requests: any[] = [
-            {
-              insertTable: {
-                location: { index: insertIndex },
-                rows: tableData.length,
-                columns: maxCols,
+            // Get document to find the end index
+            const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' }) as { body: { content: Array<{ endIndex: number }> } };
+            const endOfDoc = doc.body.content[doc.body.content.length - 1].endIndex;
+            const insertIndex = Math.max(1, endOfDoc - 1);
+
+            // Build requests: first insert empty table, then populate cells in reverse order
+            const requests: any[] = [
+              {
+                insertTable: {
+                  location: { index: insertIndex },
+                  rows: tableData.length,
+                  columns: maxCols,
+                },
               },
-            },
-            ...buildTableInsertRequests(tableData, insertIndex),
-          ];
+              ...buildTableInsertRequests(tableData, insertIndex),
+            ];
 
-          await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-            method: 'POST',
-            body: JSON.stringify({ requests }),
-          });
+            await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+              method: 'POST',
+              body: JSON.stringify({ requests }),
+            });
 
-          // Clear inherited formatting on the newly inserted table
-          if (clear_inherited_formatting !== false) {
-            const updatedDoc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
-            const tables = updatedDoc.body.content.filter((el: any) => el.table);
-            const lastTable = tables[tables.length - 1];
-            if (lastTable) {
-              await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
-                method: 'POST',
-                body: JSON.stringify({
-                  requests: [clearInheritedFormattingRequest(lastTable.startIndex + 1, lastTable.endIndex)],
-                }),
-              });
+            // Clear inherited formatting on the newly inserted table — best-effort.
+            // The table is already inserted at this point; if this second
+            // batchUpdate fails, we still want to surface success and warn
+            // about the formatting step rather than fail the whole operation.
+            let formattingWarning: string | undefined;
+            if (clear_inherited_formatting !== false) {
+              try {
+                const updatedDoc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
+                const tables = updatedDoc.body.content.filter((el: any) => el.table);
+                const lastTable = tables[tables.length - 1];
+                if (lastTable) {
+                  await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      requests: [clearInheritedFormattingRequest(lastTable.startIndex + 1, lastTable.endIndex)],
+                    }),
+                  });
+                }
+              } catch (formattingErr) {
+                formattingWarning = formattingErr instanceof Error ? formattingErr.message : String(formattingErr);
+              }
             }
-          }
 
-          const output = {
-            id: document_id,
-            rows: tableData.length,
-            columns: maxCols,
-            message: `Table inserted with ${tableData.length} rows and ${maxCols} columns`,
-          };
-          return {
-            content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
-            structuredContent: output,
-          };
+            const output: {
+              id: string;
+              rows: number;
+              columns: number;
+              message: string;
+              warning?: string;
+            } = {
+              id: document_id,
+              rows: tableData.length,
+              columns: maxCols,
+              message: `Table inserted with ${tableData.length} rows and ${maxCols} columns`,
+            };
+            if (formattingWarning) {
+              output.warning = `Table inserted, but clearing inherited formatting failed: ${formattingWarning}`;
+            }
+            return {
+              content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+              structuredContent: output,
+            };
+          } catch (err) {
+            return toolErrorResponse(err);
+          }
         }),
       },
       get_document_images: {
@@ -1145,72 +1290,80 @@ export class GoogleDocsTools {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ document_id }: any, context: any) => {
-          const { accessToken } = context;
+          try {
+            const { accessToken } = context;
 
-          const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
-          const inlineObjects = doc.inlineObjects || {};
-          const objectIds = Object.keys(inlineObjects);
+            const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
+            const inlineObjects = doc.inlineObjects || {};
+            const objectIds = Object.keys(inlineObjects);
 
-          if (objectIds.length === 0) {
-            return {
-              content: [{ type: 'text' as const, text: 'No images found in this document.' }],
-            };
-          }
-
-          const content: any[] = [];
-
-          for (const objectId of objectIds) {
-            const obj = inlineObjects[objectId];
-            const imageProps = obj?.inlineObjectProperties?.embeddedObject;
-            const imageUrl = imageProps?.imageProperties?.sourceUri || imageProps?.imageProperties?.contentUri;
-            const title = imageProps?.title || '';
-            const description = imageProps?.description || '';
-
-            if (!imageUrl) continue;
-
-            try {
-              const response = await fetch(imageUrl, {
-                headers: { 'Authorization': `Bearer ${accessToken}` },
-              });
-
-              if (!response.ok) continue;
-
-              const contentLength = parseInt(response.headers.get('content-length') || '0');
-              if (contentLength > MAX_IMAGE_SIZE) {
-                content.push({ type: 'text' as const, text: `Image '${title || objectId}' exceeds the 20MB limit, skipping.` });
-                continue;
-              }
-
-              const contentType = response.headers.get('content-type') || 'image/png';
-              const arrayBuffer = await response.arrayBuffer();
-
-              if (arrayBuffer.byteLength > MAX_IMAGE_SIZE) {
-                content.push({ type: 'text' as const, text: `Image '${title || objectId}' exceeds the 20MB limit, skipping.` });
-                continue;
-              }
-              const bytes = new Uint8Array(arrayBuffer);
-              let binary = '';
-              for (let i = 0; i < bytes.length; i++) {
-                binary += String.fromCharCode(bytes[i]);
-              }
-              const base64Data = btoa(binary);
-
-              if (title || description) {
-                content.push({ type: 'text' as const, text: `Image: ${title || description}` });
-              }
-              content.push({ type: 'image' as const, data: base64Data, mimeType: contentType });
-            } catch {
-              content.push({ type: 'text' as const, text: `Failed to fetch image: ${title || objectId}` });
+            if (objectIds.length === 0) {
+              return {
+                content: [{ type: 'text' as const, text: 'No images found in this document.' }],
+              };
             }
-          }
 
-          if (content.length === 0) {
-            return {
-              content: [{ type: 'text' as const, text: 'Found image references but could not fetch any images.' }],
-            };
-          }
+            const content: any[] = [];
 
-          return { content };
+            for (const objectId of objectIds) {
+              const obj = inlineObjects[objectId];
+              const imageProps = obj?.inlineObjectProperties?.embeddedObject;
+              const imageUrl = imageProps?.imageProperties?.sourceUri || imageProps?.imageProperties?.contentUri;
+              const title = imageProps?.title || '';
+              const description = imageProps?.description || '';
+
+              if (!imageUrl) continue;
+
+              try {
+                const response = await fetch(imageUrl, {
+                  headers: { 'Authorization': `Bearer ${accessToken}` },
+                });
+
+                if (!response.ok) {
+                  content.push({ type: 'text' as const, text: `Failed to fetch image '${title || objectId}' (status ${response.status}).` });
+                  continue;
+                }
+
+                const contentLength = parseInt(response.headers.get('content-length') || '0', 10);
+                if (contentLength > MAX_IMAGE_SIZE) {
+                  content.push({ type: 'text' as const, text: `Image '${title || objectId}' exceeds the 20MB limit, skipping.` });
+                  continue;
+                }
+
+                const contentType = response.headers.get('content-type') || 'image/png';
+                const arrayBuffer = await response.arrayBuffer();
+
+                if (arrayBuffer.byteLength > MAX_IMAGE_SIZE) {
+                  content.push({ type: 'text' as const, text: `Image '${title || objectId}' exceeds the 20MB limit, skipping.` });
+                  continue;
+                }
+                const bytes = new Uint8Array(arrayBuffer);
+                let binary = '';
+                for (let i = 0; i < bytes.length; i++) {
+                  binary += String.fromCharCode(bytes[i]);
+                }
+                const base64Data = btoa(binary);
+
+                if (title || description) {
+                  content.push({ type: 'text' as const, text: `Image: ${title || description}` });
+                }
+                content.push({ type: 'image' as const, data: base64Data, mimeType: contentType });
+              } catch (fetchErr) {
+                const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+                content.push({ type: 'text' as const, text: `Failed to fetch image '${title || objectId}': ${msg}` });
+              }
+            }
+
+            if (content.length === 0) {
+              return {
+                content: [{ type: 'text' as const, text: 'Found image references but could not fetch any images.' }],
+              };
+            }
+
+            return { content };
+          } catch (err) {
+            return toolErrorResponse(err);
+          }
         }),
       },
 
