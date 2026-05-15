@@ -843,12 +843,17 @@ export class GoogleDocsTools {
 
             // If structure requested, also fetch from Docs API.
             // `includeTabsContent=true` is required for tabbed documents —
-            // without it, `tabs[*].documentTab.body.content` is omitted. The
-            // top-level `body.content` always reflects the first/default tab,
-            // which is what this server's index-based mutating tools target.
+            // without it, `tabs[*].documentTab.body.content` is omitted.
+            // For tabbed documents, Docs omits the root `body.content` and
+            // returns the per-tab body under `tabs[*].documentTab.body`; we
+            // fall back to the first/default tab so structure and headings
+            // line up with the indices our mutating tools target.
             if (include_structure) {
               const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
-              const body = doc.body?.content || [];
+              let body: any[] = doc.body?.content || [];
+              if (body.length === 0 && Array.isArray(doc.tabs) && doc.tabs.length > 0) {
+                body = doc.tabs[0]?.documentTab?.body?.content || [];
+              }
               output.structure = parseDocumentStructure(body);
               output.headings = extractHeadings(body);
               if (typeof doc.revisionId === 'string') {
@@ -1406,19 +1411,40 @@ export class GoogleDocsTools {
             // The table is already inserted at this point; if this second
             // batchUpdate fails, we still want to surface success and warn
             // about the formatting step rather than fail the whole operation.
+            //
+            // Locate OUR table by matching the known insertion point AND shape.
+            // A naive `lastTable` lookup would strip formatting from a
+            // different table if a concurrent edit appended one after our
+            // insert; this also accounts for the rare case where another
+            // client inserted at the same stale end position by additionally
+            // matching rows/columns. If more than one table still satisfies
+            // both filters, we refuse to guess and surface a warning instead
+            // of silently formatting the wrong table.
             let formattingWarning: string | undefined;
             if (clear_inherited_formatting !== false) {
               try {
                 const updatedDoc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
-                const tables = updatedDoc.body.content.filter((el: any) => el.table);
-                const lastTable = tables[tables.length - 1];
-                if (lastTable) {
+                const allTables = (updatedDoc.body?.content || []).filter((el: any) => el.table);
+                const candidates = allTables.filter((t: any) =>
+                  typeof t.startIndex === 'number' &&
+                  typeof t.endIndex === 'number' &&
+                  t.startIndex >= insertIndex - 1 &&
+                  t.startIndex <= insertIndex + 1 &&
+                  t.table?.rows === tableData.length &&
+                  t.table?.columns === maxCols
+                );
+                if (candidates.length === 1) {
+                  const ourTable = candidates[0];
                   await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
                     method: 'POST',
                     body: JSON.stringify({
-                      requests: [clearInheritedFormattingRequest(lastTable.startIndex + 1, lastTable.endIndex)],
+                      requests: [clearInheritedFormattingRequest(ourTable.startIndex + 1, ourTable.endIndex)],
                     }),
                   });
+                } else if (candidates.length === 0) {
+                  formattingWarning = 'Could not locate the inserted table to clear formatting (document may have been edited concurrently).';
+                } else {
+                  formattingWarning = `Skipped clearing formatting: ${candidates.length} tables match the insertion point and shape; refusing to guess which is ours.`;
                 }
               } catch (formattingErr) {
                 formattingWarning = formattingErr instanceof Error ? formattingErr.message : String(formattingErr);
