@@ -156,6 +156,22 @@ function parseDocumentStructure(content: any[]): Array<{ type: string; startInde
 }
 
 /**
+ * Build a Docs API `updateTextStyle` request that clears inherited character
+ * formatting (bold, italic, underline, strikethrough, link) on the given range.
+ * Centralised so all "insert + optionally reset formatting" tools agree on the
+ * exact set of fields cleared.
+ */
+function clearInheritedFormattingRequest(startIndex: number, endIndex: number): any {
+  return {
+    updateTextStyle: {
+      range: { startIndex, endIndex },
+      textStyle: {},
+      fields: 'bold,italic,underline,strikethrough,link',
+    },
+  };
+}
+
+/**
  * Build table insert requests in reverse order to avoid index shifts.
  *
  * Table structure in Google Docs:
@@ -175,7 +191,9 @@ function buildTableInsertRequests(
 ): any[] {
   const requests: any[] = [];
   const numRows = tableData.length;
-  const numCols = tableData[0].length;
+  if (numRows === 0) return requests;
+  const numCols = tableData[0]?.length ?? 0;
+  if (numCols === 0) return requests;
 
   for (let row = numRows - 1; row >= 0; row--) {
     const rowIndex = 3 + row * 2 * numCols + row;
@@ -745,13 +763,7 @@ export class GoogleDocsTools {
           }];
 
           if (clear_inherited_formatting !== false) {
-            requests.push({
-              updateTextStyle: {
-                range: { startIndex: endIndex, endIndex: endIndex + text.length },
-                textStyle: {},
-                fields: 'bold,italic,underline,strikethrough,link',
-              },
-            });
+            requests.push(clearInheritedFormattingRequest(endIndex, endIndex + text.length));
           }
 
           await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
@@ -881,13 +893,7 @@ export class GoogleDocsTools {
           }];
 
           if (clear_inherited_formatting === true) {
-            requests.push({
-              updateTextStyle: {
-                range: { startIndex: index, endIndex: index + text.length },
-                textStyle: {},
-                fields: 'bold,italic,underline,strikethrough,link',
-              },
-            });
+            requests.push(clearInheritedFormattingRequest(index, index + text.length));
           }
 
           await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
@@ -1114,13 +1120,7 @@ export class GoogleDocsTools {
               await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
                 method: 'POST',
                 body: JSON.stringify({
-                  requests: [{
-                    updateTextStyle: {
-                      range: { startIndex: lastTable.startIndex + 1, endIndex: lastTable.endIndex },
-                      textStyle: {},
-                      fields: 'bold,italic,underline,strikethrough,link',
-                    },
-                  }],
+                  requests: [clearInheritedFormattingRequest(lastTable.startIndex + 1, lastTable.endIndex)],
                 }),
               });
             }
