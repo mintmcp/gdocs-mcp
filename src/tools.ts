@@ -19,14 +19,19 @@ class GoogleApiError extends Error {
   code?: string;
   retryAfter?: number;
   api: 'drive' | 'docs';
+  // Google's `error.details[]` payload (e.g. `BadRequest.fieldViolations`,
+  // `Help`, request-index hints). Surfaced so callers can pinpoint which
+  // request in a multi-request batchUpdate actually failed.
+  details?: unknown[];
 
-  constructor(message: string, status: number, api: 'drive' | 'docs', opts: { code?: string; retryAfter?: number } = {}) {
+  constructor(message: string, status: number, api: 'drive' | 'docs', opts: { code?: string; retryAfter?: number; details?: unknown[] } = {}) {
     super(message);
     this.name = 'GoogleApiError';
     this.status = status;
     this.api = api;
     this.code = opts.code;
     this.retryAfter = opts.retryAfter;
+    this.details = opts.details;
   }
 }
 
@@ -53,6 +58,9 @@ async function buildGoogleApiError(
   const errorJson = errorText ? safeJsonParse(errorText) : null;
   const googleMessage: string | undefined = errorJson?.error?.message;
   const googleCode: string | undefined = errorJson?.error?.status;
+  const googleDetails: unknown[] | undefined = Array.isArray(errorJson?.error?.details) && errorJson.error.details.length > 0
+    ? errorJson.error.details
+    : undefined;
 
   let message: string;
   switch (response.status) {
@@ -85,7 +93,7 @@ async function buildGoogleApiError(
     }
   }
 
-  return new GoogleApiError(message, response.status, api, { code: googleCode, retryAfter });
+  return new GoogleApiError(message, response.status, api, { code: googleCode, retryAfter, details: googleDetails });
 }
 
 /**
@@ -102,6 +110,7 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
       status: err.status,
       code: err.code,
       ...(err.retryAfter !== undefined ? { retryAfter: err.retryAfter } : {}),
+      ...(err.details !== undefined ? { details: err.details } : {}),
       api: err.api,
     };
   } else if (err instanceof Error) {
