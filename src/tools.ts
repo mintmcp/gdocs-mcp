@@ -627,9 +627,17 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
+            // Drive query strings are single-quoted; escape backslash first
+            // (so the next-step `'` escapes survive), then escape `'`, then
+            // reject newlines outright — Drive's query parser does not accept
+            // them and silently mismatched queries are worse than a clear error.
+            if (name && /[\r\n]/.test(name)) {
+              throw new Error('search name must not contain newline characters');
+            }
+            const escapedName = name ? name.replace(/\\/g, '\\\\').replace(/'/g, "\\'") : '';
             let q = `mimeType = 'application/vnd.google-apps.document'`;
-            if (name) {
-              q += ` and name contains '${name.replace(/'/g, "\\'")}'`;
+            if (escapedName) {
+              q += ` and name contains '${escapedName}'`;
             }
             q += ` and trashed = false`;
 
@@ -897,6 +905,12 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
+            // Docs API returns 400 on empty `old_text`; reject up-front with a
+            // clear structured error.
+            if (typeof old_text !== 'string' || old_text.length === 0) {
+              throw new Error('old_text must be a non-empty string');
+            }
+
             const result = await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
               body: JSON.stringify({
@@ -947,6 +961,9 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
+            if (startIndex < 0) throw new Error('startIndex must be >= 0');
+            if (endIndex <= startIndex) throw new Error('endIndex must be greater than startIndex');
+
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
               body: JSON.stringify({
@@ -991,6 +1008,10 @@ export class GoogleDocsTools {
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, index, clear_inherited_formatting }: any, context: any) => {
           try {
             const { accessToken } = context;
+
+            // Docs body content starts at index 1 (index 0 is the document
+            // start sentinel); inserting at 0 always 400s.
+            if (index < 1) throw new Error('index must be >= 1 (Docs body starts at index 1)');
 
             const requests: any[] = [{
               insertText: {
@@ -1041,6 +1062,9 @@ export class GoogleDocsTools {
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, bold, italic, underline, strikethrough, link_url }: any, context: any) => {
           try {
             const { accessToken } = context;
+
+            if (startIndex < 0) throw new Error('startIndex must be >= 0');
+            if (endIndex <= startIndex) throw new Error('endIndex must be greater than startIndex');
 
             // Build textStyle and fields dynamically from provided params
             const textStyle: any = {};
@@ -1113,12 +1137,15 @@ export class GoogleDocsTools {
           document_id: z.string().describe('Google Doc ID'),
           startIndex: z.coerce.number().int().describe('Start index of paragraph range'),
           endIndex: z.coerce.number().int().describe('End index of paragraph range (exclusive)'),
-          heading_level: z.coerce.number().int().optional().describe('Heading level: 0=normal text, 1-6=heading levels'),
+          heading_level: z.coerce.number().int().min(0).max(6).optional().describe('Heading level: 0=normal text, 1-6=heading levels'),
           alignment: z.enum(['START', 'CENTER', 'END', 'JUSTIFIED']).optional().describe('Paragraph alignment'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, heading_level, alignment }: any, context: any) => {
           try {
             const { accessToken } = context;
+
+            if (startIndex < 0) throw new Error('startIndex must be >= 0');
+            if (endIndex <= startIndex) throw new Error('endIndex must be greater than startIndex');
 
             const paragraphStyle: any = {};
             const fields: string[] = [];
