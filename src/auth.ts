@@ -22,7 +22,7 @@ export function getAccessToken(): string | undefined {
  */
 export function withGoogleAuth<TArgs>(
   _scope: string,
-  handler: (args: TArgs, context: { accessToken: string; contextKey: string }) => Promise<any>,
+  handler: (args: TArgs, context: { accessToken: string }) => Promise<any>,
 ) {
   return async (args: TArgs) => {
     const accessToken = getAccessToken();
@@ -40,21 +40,6 @@ export function withGoogleAuth<TArgs>(
         isError: true,
       };
     }
-    // Provide a `contextKey` echoing the token so legacy handlers that
-    // call RequestContextManager.getAccessToken(contextKey) still work
-    // without modification.
-    return handler(args, { accessToken, contextKey: accessToken });
+    return handler(args, { accessToken });
   };
 }
-
-/**
- * Compatibility shim for handler code ported from the Cloudflare service
- * which calls `RequestContextManager.getAccessToken(contextKey)`. We pass
- * the token itself as the contextKey from `withGoogleAuth`, so this just
- * returns it back.
- */
-export const RequestContextManager = {
-  getAccessToken(contextKey: string): string | undefined {
-    return contextKey || undefined;
-  },
-};

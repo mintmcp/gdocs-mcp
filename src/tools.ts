@@ -3,7 +3,7 @@
  */
 
 import { z } from 'zod';
-import { withGoogleAuth as requirePermissionSecure, RequestContextManager } from "./auth.js";
+import { withGoogleAuth as requirePermissionSecure } from "./auth.js";
 
 const GOOGLE_DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const GOOGLE_DOCS_API = 'https://docs.googleapis.com/v1/documents';
@@ -540,12 +540,7 @@ export class GoogleDocsTools {
           page_token: z.string().optional().describe('Token for fetching the next page of results'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ name, page_token }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           let q = `mimeType = 'application/vnd.google-apps.document'`;
           if (name) {
@@ -601,12 +596,7 @@ export class GoogleDocsTools {
           include_comments: z.boolean().optional().describe('Include comment thread metadata (author email/name, timestamp, replies, resolved status, emoji reactions). `content` is returned verbatim — no inline markers are inserted. Each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchor deleted by later edits) omit `anchor_offset`.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ document_id, include_structure, include_comments }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           // Get file metadata for title and link
           const metadata = await makeDriveRequest(
@@ -677,12 +667,7 @@ export class GoogleDocsTools {
           parent_folder_id: z.string().optional().describe('ID of the folder to create the document in (supports shared drive folders)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ title, body, parent_folder_id }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           // Create the document via Drive API so we can specify parent folder
           const fileMetadata: any = {
@@ -745,12 +730,7 @@ export class GoogleDocsTools {
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from preceding text on the newly appended content. Defaults to true.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, clear_inherited_formatting }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           // Get document to find the end index
           const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' }) as { body: { content: Array<{ endIndex: number }> } };
@@ -804,12 +784,7 @@ export class GoogleDocsTools {
           match_case: z.boolean().optional().describe('Whether to match case (default true)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, old_text, new_text, match_case }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           const result = await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
             method: 'POST',
@@ -855,12 +830,7 @@ export class GoogleDocsTools {
           endIndex: z.coerce.number().int().describe('End index of content to delete (exclusive)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
             method: 'POST',
@@ -901,12 +871,7 @@ export class GoogleDocsTools {
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from surrounding text on the newly inserted content. Defaults to false.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, index, clear_inherited_formatting }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           const requests: any[] = [{
             insertText: {
@@ -958,12 +923,7 @@ export class GoogleDocsTools {
           link_url: z.string().optional().describe('Set hyperlink URL'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, bold, italic, underline, strikethrough, link_url }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           // Build textStyle and fields dynamically from provided params
           const textStyle: any = {};
@@ -1032,12 +992,7 @@ export class GoogleDocsTools {
           alignment: z.enum(['START', 'CENTER', 'END', 'JUSTIFIED']).optional().describe('Paragraph alignment'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, heading_level, alignment }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           const paragraphStyle: any = {};
           const fields: string[] = [];
@@ -1107,12 +1062,7 @@ export class GoogleDocsTools {
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting on the newly appended table content. Defaults to true.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, rows, clear_inherited_formatting }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           if (!rows || rows.length === 0) {
             throw new Error('Table must have at least one row');
@@ -1195,12 +1145,7 @@ export class GoogleDocsTools {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ document_id }: any, context: any) => {
-          const contextKey = context.contextKey;
-          const accessToken = RequestContextManager.getAccessToken(contextKey);
-
-          if (!accessToken) {
-            throw new Error('No access token available');
-          }
+          const { accessToken } = context;
 
           const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
           const inlineObjects = doc.inlineObjects || {};
