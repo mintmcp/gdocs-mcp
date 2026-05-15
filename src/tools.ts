@@ -169,6 +169,36 @@ async function makeDocsRequest(
 }
 
 /**
+ * Flatten the nested `tabs` array (a tab can have `childTabs`) into a single
+ * summary list. Returns an empty array for documents without tabs. Each entry
+ * surfaces `tabId` + `title` (+ position metadata) so callers know multi-tab
+ * documents exist; this server's index-based mutating tools target the body
+ * of the default tab and do not yet support cross-tab editing.
+ */
+function summarizeTabs(tabs: any[] | undefined): Array<{ tabId: string; title?: string; index?: number; nestingLevel?: number }> {
+  if (!tabs || tabs.length === 0) return [];
+  const out: Array<{ tabId: string; title?: string; index?: number; nestingLevel?: number }> = [];
+  const walk = (list: any[], depth: number) => {
+    for (const tab of list) {
+      const props = tab?.tabProperties || {};
+      if (props.tabId) {
+        out.push({
+          tabId: props.tabId,
+          ...(props.title !== undefined ? { title: props.title } : {}),
+          ...(props.index !== undefined ? { index: props.index } : {}),
+          ...(props.nestingLevel !== undefined ? { nestingLevel: props.nestingLevel } : { nestingLevel: depth }),
+        });
+      }
+      if (Array.isArray(tab?.childTabs) && tab.childTabs.length > 0) {
+        walk(tab.childTabs, depth + 1);
+      }
+    }
+  };
+  walk(tabs, 0);
+  return out;
+}
+
+/**
  * Map a Docs `namedStyleType` enum (e.g. `HEADING_3`) to its numeric heading
  * level (1-6). Returns `undefined` for non-heading styles like `NORMAL_TEXT`,
  * `TITLE`, `SUBTITLE` — callers should treat those as body paragraphs.
@@ -333,6 +363,13 @@ const headingSchema = z.object({
   text: z.string(),
   startIndex: z.number().int(),
   endIndex: z.number().int(),
+});
+
+const tabSummarySchema = z.object({
+  tabId: z.string(),
+  title: z.string().optional(),
+  index: z.number().int().optional(),
+  nestingLevel: z.number().int().optional(),
 });
 
 const reactionSchema = z.object({
@@ -722,7 +759,7 @@ export class GoogleDocsTools {
       },
 
       get_document: {
-        description: 'Read the contents of a Google Doc as plain text. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. Use search_documents to find a document ID first.',
+        description: 'Read the contents of a Google Doc as plain text. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary is returned and the plain-text `content` concatenates all tabs (via Drive export); `structure` and `headings` indices refer to the FIRST tab only — index-based mutating tools in this server target the default tab. Use search_documents to find a document ID first.',
         readOnlyHint: true,
         outputSchema: {
           id: z.string(),
@@ -731,6 +768,7 @@ export class GoogleDocsTools {
           webViewLink: z.string().optional(),
           structure: z.array(structureElementSchema).optional(),
           headings: z.array(headingSchema).optional(),
+          tabs: z.array(tabSummarySchema).optional(),
           threads: z.array(threadSchema).optional(),
         },
         schema: {
@@ -780,12 +818,20 @@ export class GoogleDocsTools {
 
             output.content = content;
 
-            // If structure requested, also fetch from Docs API
+            // If structure requested, also fetch from Docs API.
+            // `includeTabsContent=true` is required for tabbed documents —
+            // without it, `tabs[*].documentTab.body.content` is omitted. The
+            // top-level `body.content` always reflects the first/default tab,
+            // which is what this server's index-based mutating tools target.
             if (include_structure) {
-              const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
+              const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
               const body = doc.body?.content || [];
               output.structure = parseDocumentStructure(body);
               output.headings = extractHeadings(body);
+              const tabs = summarizeTabs(doc.tabs);
+              if (tabs.length > 0) {
+                output.tabs = tabs;
+              }
             }
 
             return {
