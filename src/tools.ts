@@ -169,21 +169,59 @@ async function makeDocsRequest(
 }
 
 /**
+ * Map a Docs `namedStyleType` enum (e.g. `HEADING_3`) to its numeric heading
+ * level (1-6). Returns `undefined` for non-heading styles like `NORMAL_TEXT`,
+ * `TITLE`, `SUBTITLE` — callers should treat those as body paragraphs.
+ */
+function namedStyleToHeadingLevel(namedStyleType: string | undefined): number | undefined {
+  if (!namedStyleType) return undefined;
+  const m = /^HEADING_([1-6])$/.exec(namedStyleType);
+  return m ? parseInt(m[1], 10) : undefined;
+}
+
+/**
+ * Extract heading paragraphs from `body.content` for ergonomic
+ * "insert-after-heading" / "find-section" flows. Returns headings in document
+ * order with the indices needed to drive `insert_text` / `delete_content`.
+ * The `text` is trimmed of trailing newlines but preserves internal spacing.
+ */
+function extractHeadings(content: any[]): Array<{ level: number; text: string; startIndex: number; endIndex: number }> {
+  const headings: Array<{ level: number; text: string; startIndex: number; endIndex: number }> = [];
+  for (const element of content) {
+    if (!element.paragraph) continue;
+    const level = namedStyleToHeadingLevel(element.paragraph.paragraphStyle?.namedStyleType);
+    if (level === undefined) continue;
+    const text = (element.paragraph.elements
+      ?.map((el: any) => el.textRun?.content || '')
+      .join('') || '').replace(/\n+$/, '');
+    headings.push({
+      level,
+      text,
+      startIndex: element.startIndex ?? 0,
+      endIndex: element.endIndex,
+    });
+  }
+  return headings;
+}
+
+/**
  * Parse document body.content into structural elements with indices
  */
-function parseDocumentStructure(content: any[]): Array<{ type: string; startIndex: number; endIndex: number; text?: string; inlineObjectId?: string }> {
-  const elements: Array<{ type: string; startIndex: number; endIndex: number; text?: string; inlineObjectId?: string }> = [];
+function parseDocumentStructure(content: any[]): Array<{ type: string; startIndex: number; endIndex: number; text?: string; inlineObjectId?: string; headingLevel?: number }> {
+  const elements: Array<{ type: string; startIndex: number; endIndex: number; text?: string; inlineObjectId?: string; headingLevel?: number }> = [];
 
   for (const element of content) {
     if (element.paragraph) {
       const text = element.paragraph.elements
         ?.map((el: any) => el.textRun?.content || '')
         .join('') || '';
+      const headingLevel = namedStyleToHeadingLevel(element.paragraph.paragraphStyle?.namedStyleType);
       elements.push({
         type: 'paragraph',
         startIndex: element.startIndex ?? 0,
         endIndex: element.endIndex,
         text,
+        ...(headingLevel !== undefined ? { headingLevel } : {}),
       });
 
       // Extract inline images from paragraph elements
@@ -287,7 +325,15 @@ const structureElementSchema = z.object({
   endIndex: z.number().optional(),
   text: z.string().optional(),
   inlineObjectId: z.string().optional(),
+  headingLevel: z.number().int().min(1).max(6).optional(),
 }).passthrough();
+
+const headingSchema = z.object({
+  level: z.number().int().min(1).max(6),
+  text: z.string(),
+  startIndex: z.number().int(),
+  endIndex: z.number().int(),
+});
 
 const reactionSchema = z.object({
   author_name: z.string().optional(),
@@ -676,7 +722,7 @@ export class GoogleDocsTools {
       },
 
       get_document: {
-        description: 'Read the contents of a Google Doc as plain text. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. Use search_documents to find a document ID first.',
+        description: 'Read the contents of a Google Doc as plain text. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. Use search_documents to find a document ID first.',
         readOnlyHint: true,
         outputSchema: {
           id: z.string(),
@@ -684,6 +730,7 @@ export class GoogleDocsTools {
           content: z.string(),
           webViewLink: z.string().optional(),
           structure: z.array(structureElementSchema).optional(),
+          headings: z.array(headingSchema).optional(),
           threads: z.array(threadSchema).optional(),
         },
         schema: {
@@ -736,7 +783,9 @@ export class GoogleDocsTools {
             // If structure requested, also fetch from Docs API
             if (include_structure) {
               const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}`, accessToken, { method: 'GET' });
-              output.structure = parseDocumentStructure(doc.body?.content || []);
+              const body = doc.body?.content || [];
+              output.structure = parseDocumentStructure(body);
+              output.headings = extractHeadings(body);
             }
 
             return {
