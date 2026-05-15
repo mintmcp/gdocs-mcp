@@ -178,6 +178,19 @@ async function makeDocsRequest(
 }
 
 /**
+ * Build the `writeControl` object for a Docs batchUpdate. When
+ * `requiredRevisionId` is provided, Google rejects the write if the document's
+ * current revision doesn't match — surfacing optimistic-concurrency conflicts
+ * as a 400 instead of silently overwriting a concurrent edit. Returns
+ * `undefined` when no constraint was requested so callers can spread it
+ * conditionally into the batchUpdate body.
+ */
+function buildWriteControl(requiredRevisionId: string | undefined): { requiredRevisionId: string } | undefined {
+  if (!requiredRevisionId || typeof requiredRevisionId !== 'string') return undefined;
+  return { requiredRevisionId };
+}
+
+/**
  * Flatten the nested `tabs` array (a tab can have `childTabs`) into a single
  * summary list. Returns an empty array for documents without tabs. Each entry
  * surfaces `tabId` + `title` (+ position metadata) so callers know multi-tab
@@ -768,13 +781,14 @@ export class GoogleDocsTools {
       },
 
       get_document: {
-        description: 'Read the contents of a Google Doc as plain text. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary is returned and the plain-text `content` concatenates all tabs (via Drive export); `structure` and `headings` indices refer to the FIRST tab only — index-based mutating tools in this server target the default tab. Use search_documents to find a document ID first.',
+        description: 'Read the contents of a Google Doc as plain text. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary is returned and the plain-text `content` concatenates all tabs (via Drive export); `structure` and `headings` indices refer to the FIRST tab only — index-based mutating tools in this server target the default tab. When `include_structure=true`, the response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
         readOnlyHint: true,
         outputSchema: {
           id: z.string(),
           title: z.string(),
           content: z.string(),
           webViewLink: z.string().optional(),
+          revisionId: z.string().optional(),
           structure: z.array(structureElementSchema).optional(),
           headings: z.array(headingSchema).optional(),
           tabs: z.array(tabSummarySchema).optional(),
@@ -837,6 +851,9 @@ export class GoogleDocsTools {
               const body = doc.body?.content || [];
               output.structure = parseDocumentStructure(body);
               output.headings = extractHeadings(body);
+              if (typeof doc.revisionId === 'string') {
+                output.revisionId = doc.revisionId;
+              }
               const tabs = summarizeTabs(doc.tabs);
               if (tabs.length > 0) {
                 output.tabs = tabs;
@@ -943,7 +960,7 @@ export class GoogleDocsTools {
       },
 
       append_text: {
-        description: 'Append plain text to the end of a Google Doc. Use get_document first to verify the document exists and see current content.',
+        description: 'Append plain text to the end of a Google Doc. Use get_document first to verify the document exists and see current content. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
@@ -952,8 +969,9 @@ export class GoogleDocsTools {
           document_id: z.string().describe('Google Doc ID'),
           text: z.string().describe('Plain text to append to the end of the document'),
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from preceding text on the newly appended content. Defaults to true.'),
+          required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, clear_inherited_formatting }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, clear_inherited_formatting, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -973,9 +991,10 @@ export class GoogleDocsTools {
               requests.push(clearInheritedFormattingRequest(endIndex, endIndex + text.length));
             }
 
+            const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
-              body: JSON.stringify({ requests }),
+              body: JSON.stringify({ requests, ...(writeControl ? { writeControl } : {}) }),
             });
 
             const output = {
@@ -993,7 +1012,7 @@ export class GoogleDocsTools {
       },
 
       replace_text: {
-        description: 'Replace all occurrences of a text string in a Google Doc. Use get_document first to see current content and verify the text to replace exists. Use empty new_text to delete occurrences.',
+        description: 'Replace all occurrences of a text string in a Google Doc. Use get_document first to see current content and verify the text to replace exists. Use empty new_text to delete occurrences. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           occurrencesChanged: z.number(),
@@ -1004,8 +1023,9 @@ export class GoogleDocsTools {
           old_text: z.string().describe('Text to find (all occurrences will be replaced)'),
           new_text: z.string().describe('Replacement text (empty string to delete)'),
           match_case: z.boolean().optional().describe('Whether to match case (default true)'),
+          required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, old_text, new_text, match_case }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, old_text, new_text, match_case, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1015,6 +1035,7 @@ export class GoogleDocsTools {
               throw new Error('old_text must be a non-empty string');
             }
 
+            const writeControl = buildWriteControl(required_revision_id);
             const result = await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
               body: JSON.stringify({
@@ -1027,6 +1048,7 @@ export class GoogleDocsTools {
                     },
                   },
                 }],
+                ...(writeControl ? { writeControl } : {}),
               }),
             }) as { replies: Array<{ replaceAllText?: { occurrencesChanged: number } }> };
 
@@ -1050,7 +1072,7 @@ export class GoogleDocsTools {
       },
 
       delete_content: {
-        description: 'Delete content in a Google Doc by index range. Use get_document with include_structure=true first to find the correct startIndex and endIndex.',
+        description: 'Delete content in a Google Doc by index range. Use get_document with include_structure=true first to find the correct startIndex and endIndex. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         destructiveHint: true,
         outputSchema: {
           id: z.string(),
@@ -1060,14 +1082,16 @@ export class GoogleDocsTools {
           document_id: z.string().describe('Google Doc ID'),
           startIndex: z.coerce.number().int().describe('Start index of content to delete (use get_document with include_structure to find indices)'),
           endIndex: z.coerce.number().int().describe('End index of content to delete (exclusive)'),
+          required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
             if (startIndex < 0) throw new Error('startIndex must be >= 0');
             if (endIndex <= startIndex) throw new Error('endIndex must be greater than startIndex');
 
+            const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
               body: JSON.stringify({
@@ -1080,6 +1104,7 @@ export class GoogleDocsTools {
                     },
                   },
                 }],
+                ...(writeControl ? { writeControl } : {}),
               }),
             });
 
@@ -1098,7 +1123,7 @@ export class GoogleDocsTools {
       },
 
       insert_text: {
-        description: 'Insert text at a specific position in a Google Doc. Use get_document with include_structure=true to find the correct index. NOTE: Inserted text inherits formatting from surrounding text at the insertion point. Use clear_inherited_formatting=true to reset to plain formatting.',
+        description: 'Insert text at a specific position in a Google Doc. Use get_document with include_structure=true to find the correct index. NOTE: Inserted text inherits formatting from surrounding text at the insertion point. Use clear_inherited_formatting=true to reset to plain formatting. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
@@ -1108,8 +1133,9 @@ export class GoogleDocsTools {
           text: z.string().describe('Text to insert'),
           index: z.coerce.number().int().describe('Position to insert at (use get_document with include_structure to find indices)'),
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from surrounding text on the newly inserted content. Defaults to false.'),
+          required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, index, clear_inherited_formatting }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, text, index, clear_inherited_formatting, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1128,9 +1154,10 @@ export class GoogleDocsTools {
               requests.push(clearInheritedFormattingRequest(index, index + text.length));
             }
 
+            const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
-              body: JSON.stringify({ requests }),
+              body: JSON.stringify({ requests, ...(writeControl ? { writeControl } : {}) }),
             });
 
             const output = {
@@ -1148,7 +1175,7 @@ export class GoogleDocsTools {
       },
 
       update_text_style: {
-        description: 'Apply formatting (bold, italic, underline, strikethrough, link) to a text range in a Google Doc. Use get_document with include_structure=true to find the correct indices. NOTE: If you also need to set a heading level via update_paragraph_style, do that first — heading changes reset character formatting.',
+        description: 'Apply formatting (bold, italic, underline, strikethrough, link) to a text range in a Google Doc. Use get_document with include_structure=true to find the correct indices. NOTE: If you also need to set a heading level via update_paragraph_style, do that first — heading changes reset character formatting. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
@@ -1162,8 +1189,9 @@ export class GoogleDocsTools {
           underline: z.boolean().optional().describe('Set underline'),
           strikethrough: z.boolean().optional().describe('Set strikethrough'),
           link_url: z.string().optional().describe('Set hyperlink URL'),
+          required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, bold, italic, underline, strikethrough, link_url }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, bold, italic, underline, strikethrough, link_url, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1204,6 +1232,7 @@ export class GoogleDocsTools {
               throw new Error('At least one style property must be provided (bold, italic, underline, strikethrough, link_url)');
             }
 
+            const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
               body: JSON.stringify({
@@ -1214,6 +1243,7 @@ export class GoogleDocsTools {
                     fields: fields.join(','),
                   },
                 }],
+                ...(writeControl ? { writeControl } : {}),
               }),
             });
 
@@ -1232,7 +1262,7 @@ export class GoogleDocsTools {
       },
 
       update_paragraph_style: {
-        description: 'Apply paragraph formatting (heading level, alignment) to a range in a Google Doc. Use get_document with include_structure=true to find the correct indices. WARNING: Setting heading_level applies a named style that resets character-level formatting (bold, italic, etc.). If you also need to apply text styles, call update_paragraph_style first, then apply text styles after.',
+        description: 'Apply paragraph formatting (heading level, alignment) to a range in a Google Doc. Use get_document with include_structure=true to find the correct indices. WARNING: Setting heading_level applies a named style that resets character-level formatting (bold, italic, etc.). If you also need to apply text styles, call update_paragraph_style first, then apply text styles after. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
@@ -1243,8 +1273,9 @@ export class GoogleDocsTools {
           endIndex: z.coerce.number().int().describe('End index of paragraph range (exclusive)'),
           heading_level: z.coerce.number().int().min(0).max(6).optional().describe('Heading level: 0=normal text, 1-6=heading levels'),
           alignment: z.enum(['START', 'CENTER', 'END', 'JUSTIFIED']).optional().describe('Paragraph alignment'),
+          required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, heading_level, alignment }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, startIndex, endIndex, heading_level, alignment, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1281,6 +1312,7 @@ export class GoogleDocsTools {
               throw new Error('At least one style property must be provided (heading_level, alignment)');
             }
 
+            const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
               body: JSON.stringify({
@@ -1291,6 +1323,7 @@ export class GoogleDocsTools {
                     fields: fields.join(','),
                   },
                 }],
+                ...(writeControl ? { writeControl } : {}),
               }),
             });
 
@@ -1309,7 +1342,7 @@ export class GoogleDocsTools {
       },
 
       append_table: {
-        description: 'Insert a table with data at the end of a Google Doc. Supports ragged rows (will be padded with empty cells).',
+        description: 'Insert a table with data at the end of a Google Doc. Supports ragged rows (will be padded with empty cells). Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the initial insert if the document was edited concurrently; the follow-up formatting clear is not revision-gated since it operates on the just-inserted table.',
         outputSchema: {
           id: z.string(),
           rows: z.number(),
@@ -1321,8 +1354,9 @@ export class GoogleDocsTools {
           document_id: z.string().describe('Google Doc ID'),
           rows: z.array(z.array(z.string())).describe('Table data as array of rows, each row is array of cell strings'),
           clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting on the newly appended table content. Defaults to true.'),
+          required_revision_id: z.string().optional().describe('If provided, the initial table insert fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, rows, clear_inherited_formatting }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ document_id, rows, clear_inherited_formatting, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1362,9 +1396,10 @@ export class GoogleDocsTools {
               ...buildTableInsertRequests(tableData, insertIndex),
             ];
 
+            const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
-              body: JSON.stringify({ requests }),
+              body: JSON.stringify({ requests, ...(writeControl ? { writeControl } : {}) }),
             });
 
             // Clear inherited formatting on the newly inserted table — best-effort.
