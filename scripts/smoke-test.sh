@@ -17,10 +17,34 @@ set -euo pipefail
 
 IMAGE_TAG="gdocs-mcp:smoke-$$"
 CONTAINER_NAME="gdocs-mcp-smoke-$$"
-HOST_PORT="${SMOKE_PORT:-18000}"
 EXPECTED_TOOLS=11
+
+# Pick a free local port unless one was forced via SMOKE_PORT. We probe with a
+# short-lived Python listen on :0 so the port is genuinely available right
+# before `docker run -p` claims it. Falls back to 18000 if Python isn't around.
+if [ -n "${SMOKE_PORT:-}" ]; then
+  HOST_PORT="${SMOKE_PORT}"
+elif command -v python3 >/dev/null 2>&1; then
+  HOST_PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+else
+  HOST_PORT=18000
+fi
 MCP_URL="http://127.0.0.1:${HOST_PORT}/mcp"
 HEALTH_URL="http://127.0.0.1:${HOST_PORT}/healthz"
+
+# Extract the JSON payload from a streamable-HTTP response. The transport
+# answers with SSE (`data: <json>` lines); concatenate every data line so we
+# don't miss multi-line events. Falls back to the raw body if no SSE framing
+# was found (e.g., a JSON-only response).
+extract_payload() {
+  local resp="$1"
+  local payload
+  payload="$(echo "${resp}" | awk '/^data: /{ sub(/^data: /,""); print }' | tr -d '\n')"
+  if [ -z "${payload}" ]; then
+    payload="${resp}"
+  fi
+  echo "${payload}"
+}
 
 # Resolve repo root regardless of where the script is invoked from.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -84,9 +108,7 @@ init_resp="$(curl -sf -X POST "${MCP_URL}" \
   -H "Authorization: Bearer fake-smoke-token" \
   -d '{"jsonrpc":"2.0","method":"initialize","id":1,"params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}')"
 
-# Streamable HTTP transport responds with SSE; extract the data: line.
-init_json="$(echo "${init_resp}" | awk '/^data: /{ sub(/^data: /,""); print; exit }')"
-if [ -z "${init_json}" ]; then init_json="${init_resp}"; fi
+init_json="$(extract_payload "${init_resp}")"
 echo "${init_json}" | grep -q '"protocolVersion"' \
   || fail "initialize did not return protocolVersion. body=${init_resp}"
 log "initialize OK"
@@ -98,8 +120,7 @@ list_resp="$(curl -sf -X POST "${MCP_URL}" \
   -H "Accept: application/json, text/event-stream" \
   -H "Authorization: Bearer fake-smoke-token" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":2,"params":{}}')"
-list_json="$(echo "${list_resp}" | awk '/^data: /{ sub(/^data: /,""); print; exit }')"
-if [ -z "${list_json}" ]; then list_json="${list_resp}"; fi
+list_json="$(extract_payload "${list_resp}")"
 # Count tools by matching every `"name":"<x>"` inside `"tools":[...]`.
 tool_count="$(echo "${list_json}" | grep -o '"name":"[^"]\+"' | wc -l | tr -d ' ')"
 if [ "${tool_count}" != "${EXPECTED_TOOLS}" ]; then
@@ -119,8 +140,7 @@ call_resp="$(curl -sf -X POST "${MCP_URL}" \
   -H "Accept: application/json, text/event-stream" \
   -H "Authorization: Bearer fake-smoke-token" \
   -d '{"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"search_documents","arguments":{"name":"smoke-test-nonexistent"}}}')"
-call_json="$(echo "${call_resp}" | awk '/^data: /{ sub(/^data: /,""); print; exit }')"
-if [ -z "${call_json}" ]; then call_json="${call_resp}"; fi
+call_json="$(extract_payload "${call_resp}")"
 # Must not be a 5xx-style internal error envelope. Accept any of:
 #   - "isError":true (tool-level structured error)
 #   - "Authentication failed" / "401" / "Invalid Credentials" (Google's message)
