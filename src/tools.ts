@@ -4,6 +4,20 @@
 
 import { z } from 'zod';
 import { withGoogleAuth as requirePermissionSecure } from "./auth.js";
+import {
+  buildTableInsertRequests,
+  buildWriteControl,
+  clearInheritedFormattingRequest,
+  escapeDriveQueryName,
+  extractHeadings,
+  findLetterByContent,
+  parseDocumentStructure,
+  parseExportArtifacts,
+  summarizeTabs,
+  validateIndexRange,
+  validateInsertIndex,
+  type Reaction,
+} from "./lib/docs-structure.js";
 
 const GOOGLE_DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const GOOGLE_DOCS_API = 'https://docs.googleapis.com/v1/documents';
@@ -177,199 +191,6 @@ async function makeDocsRequest(
   return response.json();
 }
 
-/**
- * Build the `writeControl` object for a Docs batchUpdate. When
- * `requiredRevisionId` is provided, Google rejects the write if the document's
- * current revision doesn't match — surfacing optimistic-concurrency conflicts
- * as a 400 instead of silently overwriting a concurrent edit. Returns
- * `undefined` when no constraint was requested so callers can spread it
- * conditionally into the batchUpdate body.
- */
-function buildWriteControl(requiredRevisionId: string | undefined): { requiredRevisionId: string } | undefined {
-  if (!requiredRevisionId || typeof requiredRevisionId !== 'string') return undefined;
-  return { requiredRevisionId };
-}
-
-/**
- * Flatten the nested `tabs` array (a tab can have `childTabs`) into a single
- * summary list. Returns an empty array for documents without tabs. Each entry
- * surfaces `tabId` + `title` (+ position metadata) so callers know multi-tab
- * documents exist; this server's index-based mutating tools target the body
- * of the default tab and do not yet support cross-tab editing.
- */
-function summarizeTabs(tabs: any[] | undefined): Array<{ tabId: string; title?: string; index?: number; nestingLevel?: number }> {
-  if (!tabs || tabs.length === 0) return [];
-  const out: Array<{ tabId: string; title?: string; index?: number; nestingLevel?: number }> = [];
-  const walk = (list: any[], depth: number) => {
-    for (const tab of list) {
-      const props = tab?.tabProperties || {};
-      if (props.tabId) {
-        out.push({
-          tabId: props.tabId,
-          ...(props.title !== undefined ? { title: props.title } : {}),
-          ...(props.index !== undefined ? { index: props.index } : {}),
-          ...(props.nestingLevel !== undefined ? { nestingLevel: props.nestingLevel } : { nestingLevel: depth }),
-        });
-      }
-      if (Array.isArray(tab?.childTabs) && tab.childTabs.length > 0) {
-        walk(tab.childTabs, depth + 1);
-      }
-    }
-  };
-  walk(tabs, 0);
-  return out;
-}
-
-/**
- * Map a Docs `namedStyleType` enum (e.g. `HEADING_3`) to its numeric heading
- * level (1-6). Returns `undefined` for non-heading styles like `NORMAL_TEXT`,
- * `TITLE`, `SUBTITLE` — callers should treat those as body paragraphs.
- */
-function namedStyleToHeadingLevel(namedStyleType: string | undefined): number | undefined {
-  if (!namedStyleType) return undefined;
-  const m = /^HEADING_([1-6])$/.exec(namedStyleType);
-  return m ? parseInt(m[1], 10) : undefined;
-}
-
-/**
- * Extract heading paragraphs from `body.content` for ergonomic
- * "insert-after-heading" / "find-section" flows. Returns headings in document
- * order with the indices needed to drive `insert_text` / `delete_content`.
- * The `text` is trimmed of trailing newlines but preserves internal spacing.
- */
-function extractHeadings(content: any[]): Array<{ level: number; text: string; startIndex: number; endIndex: number }> {
-  const headings: Array<{ level: number; text: string; startIndex: number; endIndex: number }> = [];
-  for (const element of content) {
-    if (!element.paragraph) continue;
-    const level = namedStyleToHeadingLevel(element.paragraph.paragraphStyle?.namedStyleType);
-    if (level === undefined) continue;
-    const text = (element.paragraph.elements
-      ?.map((el: any) => el.textRun?.content || '')
-      .join('') || '').replace(/\n+$/, '');
-    headings.push({
-      level,
-      text,
-      startIndex: element.startIndex ?? 0,
-      endIndex: element.endIndex,
-    });
-  }
-  return headings;
-}
-
-/**
- * Parse document body.content into structural elements with indices
- */
-function parseDocumentStructure(content: any[]): Array<{ type: string; startIndex: number; endIndex: number; text?: string; inlineObjectId?: string; headingLevel?: number }> {
-  const elements: Array<{ type: string; startIndex: number; endIndex: number; text?: string; inlineObjectId?: string; headingLevel?: number }> = [];
-
-  for (const element of content) {
-    if (element.paragraph) {
-      const text = element.paragraph.elements
-        ?.map((el: any) => el.textRun?.content || '')
-        .join('') || '';
-      const headingLevel = namedStyleToHeadingLevel(element.paragraph.paragraphStyle?.namedStyleType);
-      elements.push({
-        type: 'paragraph',
-        startIndex: element.startIndex ?? 0,
-        endIndex: element.endIndex,
-        text,
-        ...(headingLevel !== undefined ? { headingLevel } : {}),
-      });
-
-      // Extract inline images from paragraph elements
-      for (const el of element.paragraph.elements || []) {
-        if (el.inlineObjectElement) {
-          elements.push({
-            type: 'inlineImage',
-            startIndex: el.startIndex,
-            endIndex: el.endIndex,
-            inlineObjectId: el.inlineObjectElement.inlineObjectId,
-          });
-        }
-      }
-    } else if (element.table) {
-      elements.push({
-        type: 'table',
-        startIndex: element.startIndex,
-        endIndex: element.endIndex,
-      });
-    } else if (element.sectionBreak) {
-      elements.push({
-        type: 'sectionBreak',
-        startIndex: element.startIndex ?? 0,
-        endIndex: element.endIndex,
-      });
-    } else if (element.tableOfContents) {
-      elements.push({
-        type: 'tableOfContents',
-        startIndex: element.startIndex,
-        endIndex: element.endIndex,
-      });
-    }
-  }
-
-  return elements;
-}
-
-/**
- * Build a Docs API `updateTextStyle` request that clears inherited character
- * formatting (bold, italic, underline, strikethrough, link) on the given range.
- * Centralised so all "insert + optionally reset formatting" tools agree on the
- * exact set of fields cleared.
- */
-function clearInheritedFormattingRequest(startIndex: number, endIndex: number): any {
-  return {
-    updateTextStyle: {
-      range: { startIndex, endIndex },
-      textStyle: {},
-      fields: 'bold,italic,underline,strikethrough,link',
-    },
-  };
-}
-
-/**
- * Build table insert requests in reverse order to avoid index shifts.
- *
- * Table structure in Google Docs:
- *   |||
- *   |X||X||X||X| |
- *   |X||X||X||X| |
- *   ...
- *
- * Row index formula: row_index = 3 + row * (2 * num_cols) + row
- * Cell index formula: insert_index = row_index + col * 2 + 1 + table_insert_index
- *
- * Insert in reverse order so earlier inserts don't shift later indices.
- */
-function buildTableInsertRequests(
-  tableData: string[][],
-  tableInsertIndex: number
-): any[] {
-  const requests: any[] = [];
-  const numRows = tableData.length;
-  if (numRows === 0) return requests;
-  const numCols = tableData[0]?.length ?? 0;
-  if (numCols === 0) return requests;
-
-  for (let row = numRows - 1; row >= 0; row--) {
-    const rowIndex = 3 + row * 2 * numCols + row;
-    for (let col = numCols - 1; col >= 0; col--) {
-      const insertIndex = rowIndex + col * 2 + 1 + tableInsertIndex;
-      const text = String(tableData[row][col]);
-      if (text) {
-        requests.push({
-          insertText: {
-            text,
-            location: { index: insertIndex },
-          },
-        });
-      }
-    }
-  }
-
-  return requests;
-}
-
 // Output schema fragments
 const structureElementSchema = z.object({
   type: z.string().optional(),
@@ -430,12 +251,6 @@ interface DriveComment extends DriveCommentReply {
   replies?: DriveCommentReply[];
 }
 
-interface Reaction {
-  author_name: string;
-  emoji: string;
-  timestamp: string;
-}
-
 interface ThreadOutput {
   // Half-open [start, end) span into `content` where the comment is
   // anchored. Absent when the comment has no quotedFileContent
@@ -472,108 +287,6 @@ async function fetchAllComments(documentId: string, accessToken: string): Promis
   return all;
 }
 
-function normalizeForMatch(text: string): string {
-  return text.replace(/\s+/g, ' ').trim();
-}
-
-// Reactions only ever surface in the plain-text export footer (Drive Comments
-// API has no reaction field). Format is the English template
-// `<displayName> reacted with <emoji> at YYYY-MM-DD HH:MM (AM|PM)`. The HH is
-// 24-hour despite the AM/PM suffix, so we drop the suffix when parsing.
-const REACTION_RE = /^(.+?) reacted with (\S+) at (\d{4}-\d{2}-\d{2} \d{2}:\d{2})(?:\s*[AP]M)?\s*$/;
-
-interface ParsedExport {
-  // Body with the trailing letter-block removed but inline `[letter]` markers
-  // preserved. Inline markers are rewritten downstream at known thread anchor
-  // positions so legitimate `[a]` text in the doc body is left untouched.
-  body: string;
-  // letter (e.g. "a") → first non-empty line after the marker (= comment text)
-  letterContent: Map<string, string>;
-  // letter → reactions parsed from continuation lines under that marker
-  letterReactions: Map<string, Reaction[]>;
-  // Set of letters used as comment markers in the trailing block — used by
-  // the rewrite step to decide which `[X]` runs are real anchors.
-  commentLetters: Set<string>;
-}
-
-// Drive's plain-text export injects letter markers (`[a][b][c]…`) inline at
-// every comment/reply anchor position and lists each letter's comment text
-// (plus any reaction continuation lines) in a trailing block. The trailing
-// block is unambiguous and safe to strip; the inline markers are not — a
-// legitimate `[a]` typed into the doc body looks identical to a comment
-// marker, so we leave them in place here and let the caller rewrite only
-// at confirmed thread anchor positions.
-function parseExportArtifacts(plainText: string): ParsedExport {
-  const lines = plainText.split('\n');
-
-  let blockStart = -1;
-  for (let candidate = 0; candidate < lines.length; candidate++) {
-    if (!/^\[[a-z]+\]/.test(lines[candidate])) continue;
-    let inMarker = false;
-    let valid = true;
-    for (let i = candidate; i < lines.length; i++) {
-      const line = lines[i];
-      if (line.trim() === '') continue;
-      if (/^\[[a-z]+\]/.test(line)) { inMarker = true; continue; }
-      if (!inMarker) { valid = false; break; }
-    }
-    if (valid) { blockStart = candidate; break; }
-  }
-
-  const letterContent = new Map<string, string>();
-  const letterReactions = new Map<string, Reaction[]>();
-  const commentLetters = new Set<string>();
-
-  if (blockStart >= 0) {
-    let currentLetter: string | null = null;
-    for (let i = blockStart; i < lines.length; i++) {
-      const line = lines[i].replace(/\r$/, '');
-      const m = line.match(/^\[([a-z]+)\](.*)$/);
-      if (m) {
-        currentLetter = m[1];
-        commentLetters.add(currentLetter);
-        letterContent.set(currentLetter, m[2].trim());
-        letterReactions.set(currentLetter, []);
-      } else if (currentLetter !== null && line.trim() !== '') {
-        const rx = line.match(REACTION_RE);
-        if (rx) {
-          letterReactions.get(currentLetter)!.push({
-            author_name: rx[1].trim(),
-            emoji: rx[2],
-            // Emit ISO-like local time (no TZ — Google doesn't surface one).
-            // The AM/PM suffix is cosmetic; HH is already 24-hour.
-            timestamp: rx[3].replace(' ', 'T'),
-          });
-        }
-        // Non-reaction continuation lines (e.g., "N total reactions",
-        // multi-line comment text) are intentionally dropped.
-      }
-    }
-  }
-
-  const body = blockStart >= 0
-    ? lines.slice(0, blockStart).join('\n')
-    : plainText;
-
-  return {
-    body: body.replace(/[\s\r\n]+$/, ''),
-    letterContent,
-    letterReactions,
-    commentLetters,
-  };
-}
-
-function findLetterByContent(
-  letterContent: Map<string, string>,
-  apiContent: string
-): string | undefined {
-  const target = normalizeForMatch(apiContent);
-  if (!target) return undefined;
-  for (const [letter, content] of letterContent) {
-    if (normalizeForMatch(content) === target) return letter;
-  }
-  return undefined;
-}
 
 // Anchor each thread to its position in the document body using the comment's
 // `quotedFileContent.value` (the snippet of doc text the comment was attached
@@ -739,7 +452,7 @@ export class GoogleDocsTools {
             if (name && /[\r\n]/.test(name)) {
               throw new Error('search name must not contain newline characters');
             }
-            const escapedName = name ? name.replace(/\\/g, '\\\\').replace(/'/g, "\\'") : '';
+            const escapedName = escapeDriveQueryName(name);
             let q = `mimeType = 'application/vnd.google-apps.document'`;
             if (escapedName) {
               q += ` and name contains '${escapedName}'`;
@@ -1093,8 +806,7 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
-            if (startIndex < 0) throw new Error('startIndex must be >= 0');
-            if (endIndex <= startIndex) throw new Error('endIndex must be greater than startIndex');
+            validateIndexRange(startIndex, endIndex);
 
             const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
@@ -1146,7 +858,7 @@ export class GoogleDocsTools {
 
             // Docs body content starts at index 1 (index 0 is the document
             // start sentinel); inserting at 0 always 400s.
-            if (index < 1) throw new Error('index must be >= 1 (Docs body starts at index 1)');
+            validateInsertIndex(index);
 
             const requests: any[] = [{
               insertText: {
@@ -1200,8 +912,7 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
-            if (startIndex < 0) throw new Error('startIndex must be >= 0');
-            if (endIndex <= startIndex) throw new Error('endIndex must be greater than startIndex');
+            validateIndexRange(startIndex, endIndex);
 
             // Build textStyle and fields dynamically from provided params
             const textStyle: any = {};
@@ -1284,8 +995,7 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
-            if (startIndex < 0) throw new Error('startIndex must be >= 0');
-            if (endIndex <= startIndex) throw new Error('endIndex must be greater than startIndex');
+            validateIndexRange(startIndex, endIndex);
 
             const paragraphStyle: any = {};
             const fields: string[] = [];
