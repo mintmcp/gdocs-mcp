@@ -4,6 +4,7 @@
 
 import { z } from 'zod';
 import { withGoogleAuth as requirePermissionSecure } from "./auth.js";
+import { getFileLabels } from "./lib/driveLabels.js";
 import {
   buildTableInsertRequests,
   buildWriteControl,
@@ -506,6 +507,8 @@ export class GoogleDocsTools {
           headings: z.array(headingSchema).optional(),
           tabs: z.array(tabSummarySchema).optional(),
           threads: z.array(threadSchema).optional(),
+          labels: z.array(z.string()).optional(),
+          labelsError: z.string().optional(),
         },
         schema: {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
@@ -516,11 +519,14 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
-            // Get file metadata for title and link
-            const metadata = await makeDriveRequest(
-              `/files/${encodeURIComponent(document_id)}?fields=name,webViewLink&supportsAllDrives=true`,
-              accessToken
-            );
+            // Fetch metadata and Drive labels in parallel — a Doc is itself a Drive file.
+            const [metadata, { labels, error: labelsError }] = await Promise.all([
+              makeDriveRequest(
+                `/files/${encodeURIComponent(document_id)}?fields=name,webViewLink&supportsAllDrives=true`,
+                accessToken
+              ),
+              getFileLabels(document_id, accessToken),
+            ]);
 
             // Export document as plain text via Drive API.
             // Accept-Language pins the export footer (where comment reactions
@@ -578,9 +584,13 @@ export class GoogleDocsTools {
               }
             }
 
+            output.labels = labels;
+            if (labelsError) output.labelsError = labelsError;
+
             return {
               content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
               structuredContent: output,
+              _meta: labelsError ? { labels, labelsError } : { labels },
             };
           } catch (err) {
             return toolErrorResponse(err);

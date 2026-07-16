@@ -28,6 +28,7 @@ secrets — there is no per-deployment configuration to inject.
 | `https://www.googleapis.com/auth/drive.readonly` | List/search docs, fetch metadata, read comments |
 | `https://www.googleapis.com/auth/drive.file` | Create new docs in a folder |
 | `https://www.googleapis.com/auth/documents` | Read/write document content |
+| `https://www.googleapis.com/auth/drive.labels.readonly` | Resolve applied Drive labels to display names on `get_document` (optional — labels degrade to a `labelsError` and raw choice IDs without it) |
 
 ## Tool surface (11 tools)
 
