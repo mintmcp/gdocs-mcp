@@ -196,3 +196,23 @@ describe('getFileLabels', () => {
     expect(res.error).toBe('incomplete label resolution');
   });
 });
+
+describe('driveGet retry', () => {
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('retries a transient 429 on the label read and recovers', async () => {
+    let attempts = 0;
+    stubFetch([
+      ['listLabels', () => {
+        attempts += 1;
+        return attempts === 1
+          ? jsonResponse({ error: { message: 'rate limited' } }, 429)
+          : jsonResponse({ labels: [{ id: 'lbl2', fields: { t: { valueType: 'text', text: ['Internal'] } } }] });
+      }],
+    ]);
+    const res = await getFileLabels('f1', 'tok');
+    expect(attempts).toBe(2);
+    expect(res.labels).toEqual(['Internal']);
+    expect(res.error).toBeUndefined();
+  });
+});

@@ -11,17 +11,50 @@ const DRIVE_LABELS_API = 'https://drivelabels.googleapis.com/v2';
 const LABEL_SCHEMA_TTL_MS = 60 * 60 * 1000;
 const LABEL_SCHEMA_CACHE_MAX = 500;
 
+// Retry tuning for transient errors (429 / 5xx). All label calls are idempotent GETs.
+const MAX_RETRY_ATTEMPTS = 3;
+const BASE_BACKOFF_MS = 500;
+const MAX_BACKOFF_MS = 4000;
+const MAX_RETRY_AFTER_MS = 30_000;
+
+function parseRetryAfterMs(headerValue: string | null): number | undefined {
+  if (!headerValue) return undefined;
+  const trimmed = headerValue.trim();
+  const asNumber = Number(trimmed);
+  if (Number.isFinite(asNumber) && asNumber >= 0) return Math.min(asNumber * 1000, MAX_RETRY_AFTER_MS);
+  const asDate = Date.parse(trimmed);
+  if (!Number.isNaN(asDate)) return Math.max(0, Math.min(asDate - Date.now(), MAX_RETRY_AFTER_MS));
+  return undefined;
+}
+
+function backoffMs(attempt: number): number {
+  const base = Math.min(BASE_BACKOFF_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+  const jitter = base * (Math.random() * 0.5 - 0.25);
+  return Math.max(0, Math.round(base + jitter));
+}
+
 async function driveGet(endpoint: string, accessToken: string): Promise<any> {
   const url = endpoint.startsWith('http') ? endpoint : `${GOOGLE_DRIVE_API}${endpoint}`;
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
-  });
-  if (!response.ok) {
+  let lastError: Error | undefined;
+  for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+    });
+    if (response.ok) {
+      const text = await response.text();
+      return text ? JSON.parse(text) : null;
+    }
     const body = await response.text().catch(() => '');
-    throw new Error(`Drive labels API error (${response.status})${body ? `: ${body}` : ''}`);
+    lastError = new Error(`Drive labels API error (${response.status})${body ? `: ${body}` : ''}`);
+    const retryable = response.status === 429 || (response.status >= 500 && response.status <= 599);
+    if (attempt < MAX_RETRY_ATTEMPTS && retryable) {
+      const delay = parseRetryAfterMs(response.headers.get('retry-after')) ?? backoffMs(attempt);
+      if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+      continue;
+    }
+    throw lastError;
   }
-  const text = await response.text();
-  return text ? JSON.parse(text) : null;
+  throw lastError ?? new Error('Drive labels API request failed');
 }
 
 export type LabelSchema = Record<string, Record<string, string>>;
