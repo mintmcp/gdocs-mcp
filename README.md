@@ -44,11 +44,16 @@ current `revisionId` for optimistic-concurrency-controlled writes via
 `required_revision_id`. Round 2 also added structured `error.details`
 passthrough in `toolErrorResponse` envelopes.
 
-## Local build & run
+## Build the image locally
+
+Build the image straight from the repo's `Dockerfile` (from source, on the
+current branch) instead of pulling a published tag — handy for testing a
+branch or verifying a build. Build for `linux/amd64` to match the MintMCP
+runtime (required on Apple Silicon):
 
 ```bash
-docker build -t gdocs-mcp:dev .
-docker run --rm -p 8000:8000 gdocs-mcp:dev
+docker build --platform linux/amd64 -t gdocs-mcp:local .
+docker run --rm -p 8000:8000 gdocs-mcp:local
 ```
 
 The container listens on `0.0.0.0:8000`. `/healthz` returns `{"status":"ok"}`;
