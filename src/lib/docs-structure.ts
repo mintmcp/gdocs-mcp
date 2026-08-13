@@ -8,6 +8,12 @@
  * with the Docs/Drive REST calls.
  */
 
+import {
+  describeTable,
+  newStructureBudget,
+  type ReportedCellStyle,
+} from './tableModel.js';
+
 /**
  * Reactions parsed from Drive's plain-text export footer.
  */
@@ -41,6 +47,8 @@ export interface Heading {
 /**
  * A structural element flattened from `body.content`. Mirrors the small subset
  * of Google Docs element types this server cares about for index-based edits.
+ * Table elements additionally carry the shape and styling fields assembled by
+ * `describeTable`, so a caller can locate cells without a second read.
  */
 export interface StructureElement {
   type: string;
@@ -49,6 +57,22 @@ export interface StructureElement {
   text?: string;
   inlineObjectId?: string;
   headingLevel?: number;
+  rows?: number;
+  columns?: number;
+  cells?: string[][];
+  has_merged_cells?: boolean;
+  styles?: ReportedCellStyle[];
+  cell_styles?: number[][];
+}
+
+/**
+ * Structure plus a count of tables whose cells or styles were dropped, so
+ * get_document can say so rather than silently returning a partial picture.
+ */
+export interface ParsedStructure {
+  elements: StructureElement[];
+  tablesWithoutCells: number;
+  tablesWithoutStyles: number;
 }
 
 /**
@@ -149,9 +173,18 @@ export function extractHeadings(content: any[]): Heading[] {
  * and tables of contents. Unknown element types are skipped silently — Docs
  * occasionally introduces new structural elements and we'd rather emit a
  * partial structure than crash.
+ *
+ * Tables are described down to their cell text, and to their per-cell styling
+ * when `includeStyles` is set. Both draw on one document-wide budget: a
+ * document with many tables cannot drive unbounded work, and whatever the
+ * budget refuses is counted so the caller can report it.
  */
-export function parseDocumentStructure(content: any[]): StructureElement[] {
+export function parseDocumentStructure(
+  content: any[],
+  includeStyles = false,
+): ParsedStructure {
   const elements: StructureElement[] = [];
+  const budget = newStructureBudget();
 
   for (const element of content) {
     if (element.paragraph) {
@@ -179,11 +212,7 @@ export function parseDocumentStructure(content: any[]): StructureElement[] {
         }
       }
     } else if (element.table) {
-      elements.push({
-        type: 'table',
-        startIndex: element.startIndex,
-        endIndex: element.endIndex,
-      });
+      elements.push({ type: 'table', ...describeTable(element, budget, includeStyles) });
     } else if (element.sectionBreak) {
       elements.push({
         type: 'sectionBreak',
@@ -199,7 +228,11 @@ export function parseDocumentStructure(content: any[]): StructureElement[] {
     }
   }
 
-  return elements;
+  return {
+    elements,
+    tablesWithoutCells: budget.tablesWithoutCells,
+    tablesWithoutStyles: budget.tablesWithoutStyles,
+  };
 }
 
 /**
