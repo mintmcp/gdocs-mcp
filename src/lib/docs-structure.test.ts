@@ -6,6 +6,7 @@ import {
   escapeDriveQueryName,
   extractHeadings,
   findLetterByContent,
+  MAX_SEARCH_NAME_CHARS,
   namedStyleToHeadingLevel,
   normalizeForMatch,
   parseDocumentStructure,
@@ -242,6 +243,18 @@ describe('escapeDriveQueryName', () => {
     // Input:  a\b'c
     // Expected: a\\b\'c
     expect(escapeDriveQueryName("a\\b'c")).toBe("a\\\\b\\'c");
+  });
+
+  it('caps the name at MAX_SEARCH_NAME_CHARS before escaping', () => {
+    const escaped = escapeDriveQueryName('a'.repeat(MAX_SEARCH_NAME_CHARS + 50));
+    expect(escaped).toBe('a'.repeat(MAX_SEARCH_NAME_CHARS));
+  });
+
+  it('caps before escaping, so truncation cannot split an escape pair', () => {
+    // Every char needs escaping, so escaping first then cutting could leave a
+    // trailing lone backslash and break the query.
+    const escaped = escapeDriveQueryName("'".repeat(MAX_SEARCH_NAME_CHARS + 50))!;
+    expect(escaped).toBe("\\'".repeat(MAX_SEARCH_NAME_CHARS));
   });
 
   it('escapes a lone backslash', () => {

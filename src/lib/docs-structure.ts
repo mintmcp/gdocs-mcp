@@ -306,9 +306,12 @@ export function buildTableInsertRequests(
  * Drive's query parser rejects them, and a silent mismatch is worse than a
  * clear error.
  */
+/** Drive rejects an over-long query outright, so cap before escaping. */
+export const MAX_SEARCH_NAME_CHARS = 256;
+
 export function escapeDriveQueryName(name: string | undefined): string | undefined {
   if (!name) return undefined;
-  return name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  return name.slice(0, MAX_SEARCH_NAME_CHARS).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
 /**
