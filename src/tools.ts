@@ -1718,12 +1718,12 @@ export class GoogleDocsTools {
       },
 
       get_document_images: {
-        description: 'Extract all inline images from a Google Doc. Returns each image as an inline image content block. Use get_document with include_structure=true first to see where images are positioned in the document.',
+        description: 'Extract all inline images from a Google Doc. Returns each image as an inline image content block. Use get_document with include_structure=true first to see where images are positioned in the document. Google Docs only: the Docs API cannot open Word (.doc/.docx) uploads, so this tool refuses them.',
         readOnlyHint: true,
         schema: {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ document_id }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", docsOnly(async ({ document_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1798,7 +1798,7 @@ export class GoogleDocsTools {
           } catch (err) {
             return toolErrorResponse(err);
           }
-        }),
+        })),
       },
 
     };
