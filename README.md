@@ -29,13 +29,19 @@ secrets — there is no per-deployment configuration to inject.
 | `https://www.googleapis.com/auth/drive.file` | Create new docs in a folder |
 | `https://www.googleapis.com/auth/documents` | Read/write document content |
 
-## Tool surface (11 tools)
+## Tool surface (14 tools)
 
-- **Discovery** — `search_documents`
-- **Read** — `get_document` (with optional `include_structure`, `include_comments`, multi-tab summary via `includeTabsContent`), `get_document_images`
+- **Discovery** — `search_documents` (finds Word uploads too; `mimeType` says which)
+- **Read** — `get_document` (with optional `include_structure`, `include_comments`, `include_table_styles`, multi-tab summary via `includeTabsContent`), `get_document_images`
 - **Create** — `create_document` (optional initial body, optional parent folder)
-- **Insert / append text** — `insert_text` (index-based), `append_text` (end-of-doc), `append_table` (with reverse-order cell insertion)
+- **Insert / append text** — `insert_text` (index-based), `append_text` (end-of-doc)
+- **Tables** — `append_table` (end-of-doc), `insert_table` (index-based, refuses an index inside an existing table unless `allow_nested`), `update_table_style` (background, per-side borders, vertical alignment)
 - **Update text** — `replace_text`, `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/link), `update_paragraph_style` (heading level, alignment)
+- **Word uploads** — `convert_to_google_doc` turns a `.doc`/`.docx` into a new native Doc, leaving the original untouched
+
+`get_document` reads `.doc` and `.docx` uploads by parsing their bytes, since
+Drive's export endpoint 403s on them. Those files are read-only here: every
+write tool refuses them and points at `convert_to_google_doc`.
 
 Round 2 added the multi-tab summary: `get_document` now returns a `tabs`
 array when the doc uses Google Docs Tabs, plus a `headings` list and the
@@ -56,7 +62,7 @@ MCP requests POST to `/mcp`.
 ## Verifying with curl
 
 ```bash
-# List tools (should return 11).
+# List tools (should return 14).
 curl -s -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
