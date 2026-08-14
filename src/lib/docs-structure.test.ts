@@ -102,7 +102,7 @@ describe('parseDocumentStructure', () => {
       { startIndex: 8, endIndex: 50, table: { rows: 2, columns: 2 } },
       { startIndex: 50, endIndex: 60, tableOfContents: {} },
     ];
-    const structure = parseDocumentStructure(content);
+    const { elements: structure } = parseDocumentStructure(content);
     expect(structure.map((e) => e.type)).toEqual([
       'paragraph',
       'sectionBreak',
@@ -126,7 +126,7 @@ describe('parseDocumentStructure', () => {
         },
       },
     ];
-    const structure = parseDocumentStructure(content);
+    const { elements: structure } = parseDocumentStructure(content);
     expect(structure).toHaveLength(2);
     expect(structure[0].type).toBe('paragraph');
     expect(structure[0].text).toBe('Pic  end');
@@ -143,7 +143,7 @@ describe('parseDocumentStructure', () => {
       paragraph('H', { namedStyleType: 'HEADING_2' }),
       paragraph('P', { namedStyleType: 'NORMAL_TEXT' }),
     ];
-    const structure = parseDocumentStructure(content);
+    const { elements: structure } = parseDocumentStructure(content);
     expect(structure[0].headingLevel).toBe(2);
     expect(structure[1].headingLevel).toBeUndefined();
   });
@@ -153,11 +153,11 @@ describe('parseDocumentStructure', () => {
       paragraph('keep'),
       { startIndex: 5, endIndex: 6, mysteryFutureElement: {} },
     ];
-    expect(parseDocumentStructure(content)).toHaveLength(1);
+    expect(parseDocumentStructure(content).elements).toHaveLength(1);
   });
 
   it('returns an empty array for empty content', () => {
-    expect(parseDocumentStructure([])).toEqual([]);
+    expect(parseDocumentStructure([]).elements).toEqual([]);
   });
 });
 
