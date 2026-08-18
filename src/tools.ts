@@ -19,6 +19,14 @@ import {
   type Reaction,
 } from "./lib/docs-structure.js";
 import {
+  MARKDOWN_UPLOAD_MIME,
+  MAX_MARKDOWN_BYTES,
+  MULTIPART_UPLOAD_URL,
+  buildMultipartUpload,
+  isMarkdownSource,
+  markdownByteLength,
+} from "./lib/markdownImport.js";
+import {
   borderSchema,
   buildTableCellStyle,
   findTableAt,
@@ -138,6 +146,66 @@ async function buildGoogleApiError(
   }
 
   return new GoogleApiError(message, response.status, api, { code: googleCode, retryAfter, details: googleDetails });
+}
+
+/**
+ * True only when Drive judged the file itself unconvertible. Auth, throttling,
+ * outages and requests that never completed are about the service, not the
+ * content, and must not be reported to the caller as a bad document.
+ */
+function isConversionRefusal(err: unknown): boolean {
+  if (!(err instanceof GoogleApiError)) return false;
+  const { status } = err;
+  return status >= 400 && status < 500 &&
+    status !== 401 && status !== 403 && status !== 404 &&
+    status !== 408 && status !== 425 && status !== 429;
+}
+
+interface DriveFile {
+  id: string;
+  name: string;
+  mimeType?: string;
+  webViewLink?: string;
+}
+
+/**
+ * Both creation paths request mimeType explicitly, so anything other than a Doc
+ * means Drive stored the bytes without converting them and the file is a stray.
+ */
+function assertNativeDoc(file: DriveFile, describeSource: string, strayUrl: string): void {
+  if (file.mimeType === NATIVE_DOC_MIME) return;
+  throw new Error(
+    `Drive stored ${describeSource} as ${file.mimeType || 'an unreported type'} instead of ` +
+    `converting it to a Google Doc. The file is at ${strayUrl} — delete it or convert it ` +
+    `manually rather than creating another.`
+  );
+}
+
+/** Drive's importer does the conversion; the multipart envelope just carries metadata + bytes. */
+async function importMarkdownDoc(
+  metadata: object,
+  body: string,
+  accessToken: string
+): Promise<DriveFile> {
+  const upload = buildMultipartUpload(metadata, body, MARKDOWN_UPLOAD_MIME);
+  let file: DriveFile;
+  try {
+    file = await makeDriveRequest(MULTIPART_UPLOAD_URL, accessToken, {
+      method: 'POST',
+      headers: { 'Content-Type': upload.contentType },
+      body: upload.body,
+    });
+  } catch (err) {
+    console.error(`[MD_IMPORT] fail status=${err instanceof GoogleApiError ? err.status : 'none'} msg=${err instanceof Error ? err.message : String(err)}`);
+    if (!isConversionRefusal(err)) throw err;
+    throw new Error(
+      `Drive could not convert this markdown into a Google Doc. Retry with body_format "plain" ` +
+      `to store the text as written, or simplify the markdown.`
+    );
+  }
+
+  assertNativeDoc(file, 'the upload', `https://drive.google.com/file/d/${file.id}/view`);
+  return file;
 }
 
 /**
@@ -817,7 +885,12 @@ export class GoogleDocsTools {
       },
 
       create_document: {
-        description: 'Create a new Google Doc with optional initial text content. Optionally place it in a specific folder (including shared drive folders).',
+        description:
+          'Create a new Google Doc with optional initial content. The body is treated as markdown ' +
+          'by default and imported as real Google Docs formatting — headings, lists, links, bold, ' +
+          'italic, inline code, horizontal rules and tables all become native styles, so there is ' +
+          'no need to follow up with styling tools. Pass body_format "plain" to keep the text ' +
+          'verbatim instead. Optionally place it in a specific folder (including shared drive folders).',
         outputSchema: {
           id: z.string(),
           title: z.string(),
@@ -826,10 +899,19 @@ export class GoogleDocsTools {
         },
         schema: {
           title: z.string().describe('Title for the new document'),
-          body: z.string().optional().describe('Optional initial plain text content'),
+          body: z.string().optional().describe(
+            'Optional initial content. Markdown unless body_format is "plain". As markdown, ' +
+            'separate paragraphs with a blank line — single newlines are joined into one paragraph.'
+          ),
+          body_format: z.enum(['markdown', 'plain']).optional().describe(
+            'How to interpret body. Defaults to "markdown", which reflows the text and consumes ' +
+            'markdown punctuation such as *, _ and #. Use "plain" whenever the literal characters ' +
+            'and line breaks must be preserved exactly, such as pasted code or a document about ' +
+            'markdown syntax.'
+          ),
           parent_folder_id: z.string().optional().describe('ID of the folder to create the document in (supports shared drive folders)'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ title, body, parent_folder_id }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", async ({ title, body, body_format, parent_folder_id }: any, context: any) => {
           let file: { id: string; name: string } | undefined;
           try {
             const { accessToken } = context;
@@ -841,6 +923,33 @@ export class GoogleDocsTools {
             };
             if (parent_folder_id) {
               fileMetadata.parents = [parent_folder_id];
+            }
+
+            const asMarkdown = Boolean(body) && (body_format ?? 'markdown') === 'markdown';
+            const bytes = body ? markdownByteLength(body) : 0;
+
+            // Capped for either format: otherwise body_format 'plain' reads as a way
+            // around the limit rather than a way to keep text literal.
+            if (bytes > MAX_MARKDOWN_BYTES) {
+              throw new Error(
+                `Body is ${bytes} bytes, above the ${MAX_MARKDOWN_BYTES} limit for create_document, ` +
+                `which applies to both body formats. Split it across documents, or upload the file to ` +
+                `Drive and call convert_to_google_doc.`
+              );
+            }
+
+            if (asMarkdown) {
+              const imported = await importMarkdownDoc(fileMetadata, body, accessToken);
+              const output = {
+                id: imported.id,
+                title: imported.name ?? title,
+                webViewLink: `https://docs.google.com/document/d/${imported.id}`,
+                message: 'Document created with markdown converted to native Google Docs formatting.',
+              };
+              return {
+                content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],
+                structuredContent: output,
+              };
             }
 
             file = await makeDriveRequest(
@@ -1630,20 +1739,24 @@ export class GoogleDocsTools {
 
       convert_to_google_doc: {
         description:
-          'Convert an uploaded Word (.doc or .docx) file into a NEW, editable native Google Doc. ' +
-          'The original Word file is left untouched. Use this when the user wants to edit a file ' +
-          'that search_documents or get_document reported with a Word mimeType. Drive performs the ' +
-          'conversion, so formatting, tables and images are preserved — far better than re-typing ' +
-          'the text into a new document.',
+          'Convert an uploaded Word (.doc or .docx) or Markdown (.md) file already in Drive into a ' +
+          'NEW, editable native Google Doc. The original file is left untouched. Drive performs the ' +
+          'conversion, so formatting, tables and images are preserved. ' +
+          'For Word, use this when the user wants to edit a file that search_documents or ' +
+          'get_document reported with a Word mimeType. ' +
+          'For Markdown, note that search_documents does not list .md files, so the user must supply ' +
+          'the Drive file id (from a Drive link or the Drive connector); prefer this over re-typing a ' +
+          'large markdown file through create_document, since Drive reads the bytes directly and ' +
+          'nothing is paraphrased or truncated.',
         outputSchema: {
           id: z.string().describe('ID of the new native Google Doc'),
           name: z.string(),
           webViewLink: z.string(),
-          sourceId: z.string().describe('The Word file this was converted from, unchanged'),
+          sourceId: z.string().describe('The source file this was converted from, unchanged'),
           message: z.string(),
         },
         schema: {
-          file_id: z.string().describe('Drive file ID of the .doc or .docx to convert'),
+          file_id: z.string().describe('Drive file ID of the .doc, .docx or .md file to convert'),
           name: z.string().optional().describe('Name for the new Doc (defaults to the original name)'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.file", async ({ file_id, name }: any, context: any) => {
@@ -1651,7 +1764,7 @@ export class GoogleDocsTools {
             const { accessToken } = context;
 
             const meta = await makeDriveRequest(
-              `/files/${encodeURIComponent(file_id)}?fields=name,mimeType,webViewLink&supportsAllDrives=true`,
+              `/files/${encodeURIComponent(file_id)}?fields=name,mimeType,size,webViewLink&supportsAllDrives=true`,
               accessToken
             );
             const sourceMime: string = meta.mimeType || '';
@@ -1661,12 +1774,34 @@ export class GoogleDocsTools {
                 `'${meta.name}' is already a native Google Doc and is editable as-is. Nothing to convert.`
               );
             }
-            if (!isWordMime(sourceMime)) {
+            const fromMarkdown = isMarkdownSource(sourceMime);
+            if (!fromMarkdown && !isWordMime(sourceMime)) {
+              const namedMarkdown = /\.(md|markdown|mdown|mkd)$/i.test(meta.name || '');
               throw new Error(
-                `'${meta.name}' is not a Word file (${sourceMime}), so it cannot be converted to a Google Doc.`
+                namedMarkdown
+                  ? `'${meta.name}' is stored as ${sourceMime}, not text/markdown, so Drive would copy it ` +
+                    `literally instead of applying markdown formatting. Re-upload it as markdown, or pass ` +
+                    `its text to create_document instead.`
+                  : `'${meta.name}' is not a Word or Markdown file (${sourceMime}), so it cannot be converted to a Google Doc.`
               );
             }
-            if (!sniffWordFormat(await fetchWordMagic(file_id, accessToken, GOOGLE_DRIVE_API))) {
+            if (fromMarkdown) {
+              const sourceBytes = Number(meta.size);
+              if (meta.size == null || meta.size === '' || !Number.isFinite(sourceBytes)) {
+                throw new Error(
+                  `Drive did not report a size for '${meta.name}', so it cannot be checked against the ` +
+                  `${MAX_MARKDOWN_BYTES} byte limit for markdown conversion. Open it directly: ${meta.webViewLink}`
+                );
+              }
+              if (sourceBytes > MAX_MARKDOWN_BYTES) {
+                throw new Error(
+                  `'${meta.name}' is ${sourceBytes} bytes, above the ${MAX_MARKDOWN_BYTES} limit for markdown conversion.`
+                );
+              }
+            }
+            // Markdown carries no container to sniff, and its mime type was checked
+            // above: only Word can claim an extension its bytes do not back up.
+            if (!fromMarkdown && !sniffWordFormat(await fetchWordMagic(file_id, accessToken, GOOGLE_DRIVE_API))) {
               throw new Error(
                 `'${meta.name}' is named like a Word file but its contents are not a Word ` +
                 `document at all, so there is nothing to convert. Open it directly: ${meta.webViewLink}`
@@ -1675,10 +1810,10 @@ export class GoogleDocsTools {
 
             // Drive owns the conversion, so its refusal arrives bare: give it the
             // file and a link like every other message this tool produces.
-            let result: { id: string; name: string; webViewLink?: string };
+            let result: DriveFile;
             try {
               result = await makeDriveRequest(
-                `/files/${encodeURIComponent(file_id)}/copy?supportsAllDrives=true`,
+                `/files/${encodeURIComponent(file_id)}/copy?supportsAllDrives=true&fields=id,name,mimeType,webViewLink`,
                 accessToken,
                 {
                   method: 'POST',
@@ -1688,15 +1823,22 @@ export class GoogleDocsTools {
                     ...(name ? { name } : {}),
                   }),
                 }
-              ) as { id: string; name: string; webViewLink?: string };
+              );
             } catch (err) {
-              const reason = (err instanceof Error ? err.message : String(err)).replace(/\.\s*$/, '');
+              console.error(`[MD_CONVERT] fail status=${err instanceof GoogleApiError ? err.status : 'none'} mime=${sourceMime} msg=${err instanceof Error ? err.message : String(err)}`);
+              // Only a refusal is about the file; anything else would send the user
+              // off re-uploading a document that was never the problem.
+              if (!isConversionRefusal(err)) throw err;
               throw new Error(
-                `Drive could not convert '${meta.name}' into a Google Doc: ${reason}. ` +
-                `It may be a different Office format stored under a Word name. ` +
+                `Drive could not convert '${meta.name}' into a Google Doc. ` +
+                (fromMarkdown
+                  ? `The file may not be text Drive can read as markdown. `
+                  : `It may be a different Office format stored under a Word name. `) +
                 `Open it directly: ${meta.webViewLink}`
               );
             }
+
+            assertNativeDoc(result, `'${meta.name}'`, `https://drive.google.com/file/d/${result.id}/view`);
 
             const output = {
               id: result.id,
