@@ -6,10 +6,6 @@ import { requestContext } from "./auth.js";
 const PORT = Number(process.env.PORT) || 8000;
 const MCP_PATH = "/mcp";
 
-// Build the McpServer ONCE at startup. Tools are registered once;
-// the per-request access token rides in AsyncLocalStorage.
-const server = createServer();
-
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
@@ -26,6 +22,10 @@ app.post(MCP_PATH, async (req: Request, res: Response) => {
     ? authHeader.slice("Bearer ".length).trim()
     : "";
 
+  // A fresh McpServer AND transport per request. The MCP Protocol owns one
+  // transport at a time, so a shared module-level server throws
+  // "Already connected to a transport" as soon as two tool calls overlap.
+  const server = createServer();
   const transport = new StreamableHTTPServerTransport({
     sessionIdGenerator: undefined,
   });
@@ -34,6 +34,7 @@ app.post(MCP_PATH, async (req: Request, res: Response) => {
     try {
       res.on("close", () => {
         transport.close().catch(() => {});
+        server.close().catch(() => {});
       });
       await server.connect(transport);
       await transport.handleRequest(req, res, req.body);
