@@ -41,6 +41,33 @@ describe('label enrichment on document reads', () => {
     }]);
   });
 
+  it('get_document success carries _meta alongside its structuredContent', async () => {
+    stubFetch([
+      ['listLabels', () => jsonResponse(LISTED_LABEL)],
+      ['drivelabels.googleapis.com', () => jsonResponse({ properties: { title: 'Classification' }, ...LABEL_SCHEMA_BODY })],
+      ['/export', () => new Response('Doc body text', { status: 200 })],
+      ['www.googleapis.com/drive', () => jsonResponse({
+        name: 'edge-doc', mimeType: 'application/vnd.google-apps.document',
+        webViewLink: 'https://docs.google.com/document/d/d1',
+      })],
+    ]);
+    const res: any = await call('get_document', { document_id: 'd1' });
+    expect(res.isError).toBeUndefined();
+    expect(res.structuredContent.content).toBe('Doc body text');
+    expect(res._meta.applied).toHaveLength(1);
+  });
+
+  it('a labels profile enriches through the granted-scope branch', async () => {
+    vi.stubEnv('PROFILE', 'labels');
+    stubFetch([
+      ['listLabels', () => jsonResponse(LISTED_LABEL)],
+      ['drivelabels.googleapis.com', () => jsonResponse({ properties: { title: 'Classification' }, ...LABEL_SCHEMA_BODY })],
+      ['docs.googleapis.com', () => jsonResponse({})],
+    ]);
+    const res: any = await call('get_document_images', { document_id: 'd1' });
+    expect(res._meta.applied).toHaveLength(1);
+  });
+
   it('a standard deployment makes no label calls and returns no _meta', async () => {
     vi.stubEnv('PROFILE', 'standard');
     const calls = stubFetch([

@@ -91,7 +91,6 @@ export async function buildGoogleApiError(
   return new GoogleApiError(message, response.status, api, { code: googleCode, retryAfter, details: googleDetails });
 }
 
-
 /**
  * Helper to make authenticated requests to Google Drive API
  */
@@ -117,7 +116,6 @@ export async function makeDriveRequest(
 
   return response.json();
 }
-
 
 /**
  * Helper to make authenticated requests to Google Docs API

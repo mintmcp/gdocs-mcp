@@ -159,7 +159,6 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
 }
 
 
-
 /** Refuse writes against Word uploads. Bound here so the wrapper stays pure. */
 const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) =>
   wrapDocsOnly(handler, makeDriveRequest);
