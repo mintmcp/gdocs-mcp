@@ -57,96 +57,18 @@ import {
   MAX_TEXT_CHARS as MAX_WORD_TEXT_CHARS,
 } from "./lib/wordText.js";
 
-const GOOGLE_DRIVE_API = 'https://www.googleapis.com/drive/v3';
-const GOOGLE_DOCS_API = 'https://docs.googleapis.com/v1/documents';
+import {
+  GOOGLE_DRIVE_API,
+  GoogleApiError,
+  safeJsonParse,
+  buildGoogleApiError,
+  makeDriveRequest,
+  makeDocsRequest,
+} from './lib/google.js';
+import { attachLabelsMeta } from './lib/driveLabels.js';
+
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
 
-/**
- * Error thrown by Google API helpers. Carries enough structured detail
- * (status, Google's `error.status` enum, retry-after) for callers to surface
- * machine-readable error envelopes instead of opaque strings.
- */
-class GoogleApiError extends Error {
-  status: number;
-  code?: string;
-  retryAfter?: number;
-  api: 'drive' | 'docs';
-  // Google's `error.details[]` payload (e.g. `BadRequest.fieldViolations`,
-  // `Help`, request-index hints). Surfaced so callers can pinpoint which
-  // request in a multi-request batchUpdate actually failed.
-  details?: unknown[];
-
-  constructor(message: string, status: number, api: 'drive' | 'docs', opts: { code?: string; retryAfter?: number; details?: unknown[] } = {}) {
-    super(message);
-    this.name = 'GoogleApiError';
-    this.status = status;
-    this.api = api;
-    this.code = opts.code;
-    this.retryAfter = opts.retryAfter;
-    this.details = opts.details;
-  }
-}
-
-function safeJsonParse(text: string): any | null {
-  try {
-    return JSON.parse(text);
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Parse a non-OK Google API response into a `GoogleApiError`.
- *
- * Note: Google's Drive/Docs APIs return 404 for both "doesn't exist" and
- * "you don't have access" — we surface a disambiguated message so callers
- * don't make wrong assumptions.
- */
-async function buildGoogleApiError(
-  response: Response,
-  api: 'drive' | 'docs'
-): Promise<GoogleApiError> {
-  const errorText = await response.text().catch(() => '');
-  const errorJson = errorText ? safeJsonParse(errorText) : null;
-  const googleMessage: string | undefined = errorJson?.error?.message;
-  const googleCode: string | undefined = errorJson?.error?.status;
-  const googleDetails: unknown[] | undefined = Array.isArray(errorJson?.error?.details) && errorJson.error.details.length > 0
-    ? errorJson.error.details
-    : undefined;
-
-  let message: string;
-  switch (response.status) {
-    case 401:
-      message = 'Authentication failed. Please re-authenticate.';
-      break;
-    case 403:
-      message = googleMessage
-        ? `Permission denied: ${googleMessage}`
-        : `Permission denied. Make sure you have granted ${api === 'docs' ? 'Docs' : 'Drive'} access.`;
-      break;
-    case 404:
-      message = api === 'docs'
-        ? 'Document not found or you do not have permission to access it'
-        : 'File or document not found or you do not have permission to access it';
-      break;
-    case 429:
-      message = googleMessage || 'Rate limit exceeded. Retry after a short delay.';
-      break;
-    default:
-      message = googleMessage || errorText || `Google ${api === 'docs' ? 'Docs' : 'Drive'} API error (${response.status})`;
-  }
-
-  let retryAfter: number | undefined;
-  if (response.status === 429 || response.status === 503) {
-    const header = response.headers.get('retry-after');
-    if (header) {
-      const parsed = parseInt(header, 10);
-      if (!Number.isNaN(parsed) && parsed >= 0) retryAfter = parsed;
-    }
-  }
-
-  return new GoogleApiError(message, response.status, api, { code: googleCode, retryAfter, details: googleDetails });
-}
 
 /**
  * True only when Drive judged the file itself unconvertible. Auth, throttling,
@@ -236,58 +158,6 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
   };
 }
 
-/**
- * Helper to make authenticated requests to Google Drive API
- */
-async function makeDriveRequest(
-  endpoint: string,
-  accessToken: string,
-  options: RequestInit = {}
-): Promise<any> {
-  const url = endpoint.startsWith('http') ? endpoint : `${GOOGLE_DRIVE_API}${endpoint}`;
-
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Accept': 'application/json',
-      ...options.headers,
-    },
-  });
-
-  if (!response.ok) {
-    throw await buildGoogleApiError(response, 'drive');
-  }
-
-  return response.json();
-}
-
-/**
- * Helper to make authenticated requests to Google Docs API
- */
-async function makeDocsRequest(
-  endpoint: string,
-  accessToken: string,
-  options: RequestInit = {}
-): Promise<any> {
-  const url = endpoint.startsWith('http') ? endpoint : `${GOOGLE_DOCS_API}${endpoint}`;
-
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Authorization': `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-      'Accept': 'application/json',
-      ...options.headers,
-    },
-  });
-
-  if (!response.ok) {
-    throw await buildGoogleApiError(response, 'docs');
-  }
-
-  return response.json();
-}
 
 /** Refuse writes against Word uploads. Bound here so the wrapper stays pure. */
 const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) =>
@@ -750,7 +620,7 @@ export class GoogleDocsTools {
           include_table_styles: z.boolean().optional().describe('Also report each table\'s cell styles, as a `styles` legend plus a `cell_styles` index grid. Requires include_structure=true. Use it to see how a table is currently formatted before matching or replicating it.'),
           include_comments: z.boolean().optional().describe('Include comment thread metadata (author email/name, timestamp, replies, resolved status, emoji reactions). `content` is returned verbatim — no inline markers are inserted. Each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchor deleted by later edits) omit `anchor_offset`.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ document_id, include_structure, include_comments, include_table_styles }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", attachLabelsMeta((a: any) => a.document_id, async ({ document_id, include_structure, include_comments, include_table_styles }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -881,7 +751,7 @@ export class GoogleDocsTools {
           } catch (err) {
             return toolErrorResponse(err);
           }
-        }),
+        })),
       },
 
       create_document: {
@@ -1865,7 +1735,7 @@ export class GoogleDocsTools {
         schema: {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", async ({ document_id }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", attachLabelsMeta((a: any) => a.document_id, async ({ document_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1940,7 +1810,7 @@ export class GoogleDocsTools {
           } catch (err) {
             return toolErrorResponse(err);
           }
-        }),
+        })),
       },
 
     };

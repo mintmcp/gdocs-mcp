@@ -28,6 +28,37 @@ secrets — there is no per-deployment configuration to inject.
 | `https://www.googleapis.com/auth/drive.readonly` | List/search docs, fetch metadata, read comments |
 | `https://www.googleapis.com/auth/drive.file` | Create new docs in a folder |
 | `https://www.googleapis.com/auth/documents` | Read/write document content |
+| `https://www.googleapis.com/auth/drive.labels.readonly` | Optional, `labels` profile only: label enrichment (see below) |
+
+### Profiles
+
+A **profile** (`PROFILES` in `src/scopes.ts`) is a frozen, named scope set,
+a connector's contract with its users:
+
+| Profile    | Scopes                                                                  |
+|------------|--------------------------------------------------------------------------|
+| `standard` | `drive.readonly` + `drive.file` + `documents`                            |
+| `labels`   | `drive.readonly` + `drive.file` + `documents` + `drive.labels.readonly`  |
+
+Each deployment selects a profile via the `PROFILE` env var; unset registers
+every tool (self-hosted default) and enriches best effort, an unknown or
+empty value fails at boot. Both profiles register every tool: the label
+scope gates the enrichment below, not a tool.
+
+### Drive label enrichment
+
+On deployments whose grant includes `drive.labels.readonly`, `get_document`
+and `get_document_images` attach the document's applied Drive labels as
+`_meta.applied`, one entry per label, `{labelId, revisionId, title,
+resolved, values[], skippedValueTypes?}`, the same tree the gdrive-mcp
+connector emits (`src/lib/driveLabels.ts` is vendored from it; keep them
+identical). Labels stay in `_meta` only: this connector has no metadata
+tool, the labels-enabled Drive connector is the fleet's visible label
+console. `user` fields are withheld, text values cap at 256 chars, lookups
+pin the applied label revision, and failures degrade to a `labelsError`
+code instead of failing the read. Without the scope no label call is made
+and no `_meta` is returned; absence means "surfacing not enabled", never
+"no labels".
 
 ## Tool surface (11 tools)
 

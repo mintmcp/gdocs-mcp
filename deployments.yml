@@ -1,0 +1,19 @@
+# profile names a frozen scope set from PROFILES in src/scopes.ts
+
+- app: gdocs-mintmcp-staging
+  env: staging
+  live: true
+  profile: standard # drive.readonly + drive.file + documents
+
+- app: gdocs-mintmcp
+  env: prod
+  live: true
+  profile: standard # drive.readonly + drive.file + documents
+
+# labels-enabled connector: flip live to true once the Fly app exists.
+# Pair it with the write-grant gate middleware and an approval rule on the
+# Drive connector's set_file_label
+- app: gdocs-mintmcp-labels
+  env: prod
+  live: false
+  profile: labels # standard + drive.labels.readonly
