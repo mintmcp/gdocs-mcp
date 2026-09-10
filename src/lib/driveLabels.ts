@@ -1,6 +1,3 @@
-// Vendored from gdrive-mcp src/labels.ts (read side); keep the applied[]
-// contract identical across the connector fleet, middleware reads one shape
-
 import { makeDriveRequest } from './google.js';
 import { grantedScopes, SCOPES } from '../scopes.js';
 
@@ -214,12 +211,6 @@ export function fetchLabelsMeta(fileId: string, accessToken: string): Promise<Re
     });
 }
 
-/**
- * Starts the label fetch before the wrapped handler so the two calls overlap,
- * then attaches _meta to whatever comes back, error envelopes included. The
- * handler sees the pending promise as context.labelsMeta when it also wants
- * the labels in its visible output
- */
 export function attachLabelsMeta<TArgs>(
   getFileId: (args: TArgs) => string,
   inner: (args: TArgs, context: any) => Promise<any>,
