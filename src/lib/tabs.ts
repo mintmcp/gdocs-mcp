@@ -1,11 +1,4 @@
-/**
- * Pure helpers for Google Docs Tabs support: resolving which tab a read or
- * write targets, building tab-aware Location/Range objects, and rendering a
- * tab's plain text from its parsed structure.
- *
- * Like docs-structure.ts, everything here is referentially transparent so it
- * can be unit-tested without mocking the network.
- */
+/** Pure helpers for Google Docs Tabs: tab resolution, tab-aware Location/Range objects, per-tab text */
 
 import {
   parseDocumentStructure,
@@ -15,11 +8,10 @@ import {
 } from './docs-structure.js';
 
 /**
- * The body a read/write targets after tab resolution. `tabId` is undefined
- * only for documents without tabs; on tabbed documents it is always explicit
- * (defaulting to the first tab) so outbound requests never rely on Google's
- * inconsistent implicit defaults (location omits-tabId → first tab, but
- * replaceAllText omits-tabsCriteria → ALL tabs).
+ * On tabbed documents `tabId` is always explicit (defaulting to the first tab)
+ * so requests never rely on Google's inconsistent implicit defaults: a location
+ * without tabId targets the first tab, but replaceAllText without tabsCriteria
+ * targets ALL tabs
  */
 export interface ResolvedTab {
   tabId?: string;
@@ -29,7 +21,6 @@ export interface ResolvedTab {
   tabs: TabSummary[];
 }
 
-/** Depth-first search of the nested tab tree for a tabId. */
 function findTabNode(tabs: any[] | undefined, tabId: string): any | undefined {
   for (const tab of tabs || []) {
     if (tab?.tabProperties?.tabId === tabId) return tab;
@@ -39,10 +30,6 @@ function findTabNode(tabs: any[] | undefined, tabId: string): any | undefined {
   return undefined;
 }
 
-/**
- * Error for an unknown tab_id, listing the tabs that do exist so the caller
- * can correct itself without another read.
- */
 export function unknownTabError(tabId: string, tabs: TabSummary[]): Error {
   const listed = tabs.map((t) => t.title ? `${t.tabId} (${t.title})` : t.tabId).join(', ');
   return new Error(
@@ -54,14 +41,8 @@ export function unknownTabError(tabId: string, tabs: TabSummary[]): Error {
 }
 
 /**
- * Resolve which body a read/write targets. The document must have been
- * fetched with `includeTabsContent=true` for tabbed documents to carry
- * their content.
- *
- * - untabbed doc, no tabId  → root body, tabId stays undefined
- * - untabbed doc, tabId     → throws
- * - tabbed doc, no tabId    → first tab, with its tabId made explicit
- * - tabbed doc, tabId       → that tab, or throws listing the tabs
+ * Resolve which body a read/write targets. The doc must have been fetched with
+ * includeTabsContent=true, or tabbed documents arrive without their content
  */
 export function resolveTab(doc: any, tabId?: string): ResolvedTab {
   const tabs = summarizeTabs(doc?.tabs);
@@ -84,12 +65,10 @@ export function resolveTab(doc: any, tabId?: string): ResolvedTab {
   };
 }
 
-/** Location for insertText/insertTable; tabId only when targeting a tab. */
 export function docLocation(index: number, tabId?: string): { index: number; tabId?: string } {
   return { index, ...(tabId ? { tabId } : {}) };
 }
 
-/** Range for delete/style requests; tabId only when targeting a tab. */
 export function docRange(
   startIndex: number,
   endIndex: number,
@@ -98,11 +77,7 @@ export function docRange(
   return { startIndex, endIndex, ...(tabId ? { tabId } : {}) };
 }
 
-/**
- * End-of-body insertion index (one before the final newline sentinel).
- * Throws when the body is empty rather than letting callers index into
- * `content[length - 1]` and crash.
- */
+/** End-of-body insertion index, one before the final newline sentinel */
 export function endOfBodyIndex(body: any[]): number {
   const last = body[body.length - 1];
   if (!last || typeof last.endIndex !== 'number') {
@@ -112,10 +87,8 @@ export function endOfBodyIndex(body: any[]): number {
 }
 
 /**
- * Render a tab's plain text from its parsed structure, so per-tab `content`
- * comes from the same source as the indices the mutating tools take. Tables
- * render as tab-separated rows; images, section breaks and tables of contents
- * contribute no text.
+ * Per-tab text is rendered from the same parsed structure the editing indices
+ * come from, because the Drive plain-text export cannot be scoped to a tab
  */
 export function renderStructureText(elements: StructureElement[]): string {
   let out = '';
@@ -129,16 +102,13 @@ export function renderStructureText(elements: StructureElement[]): string {
   return out;
 }
 
-/** Convenience: parse + render a resolved tab's text in one step. */
 export function renderTabText(body: any[]): string {
   return renderStructureText(parseDocumentStructure(body).elements);
 }
 
 /**
- * Gather inline objects from every tab (plus the legacy root field), for
- * whole-document image extraction. Tabbed documents keep per-tab
- * `documentTab.inlineObjects`; the root field only exists on responses
- * fetched without `includeTabsContent`.
+ * Tabbed documents keep inline objects per tab under documentTab.inlineObjects;
+ * the root field only appears on fetches without includeTabsContent
  */
 export function collectInlineObjects(doc: any): Record<string, any> {
   const out: Record<string, any> = { ...(doc?.inlineObjects || {}) };

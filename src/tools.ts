@@ -71,7 +71,7 @@ const GOOGLE_DOCS_API = 'https://docs.googleapis.com/v1/documents';
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
 
 // Tabs nest at most 3 levels deep, so three tabProperties selectors cover the
-// whole tree without pulling any tab content.
+// whole tree without pulling any tab content
 const TAB_LIST_FIELDS = 'revisionId,tabs.tabProperties,tabs.childTabs.tabProperties,tabs.childTabs.childTabs.tabProperties';
 
 const TAB_ID_DESCRIPTION = 'ID of the tab to target in a multi-tab document: tabProperties.tabId, the value after ?tab= in the document URL (e.g. "t.abc123"), also listed in get_document\'s `tabs`. Omit to target the first tab.';
@@ -360,7 +360,6 @@ async function insertTableAt(
     const updated = await makeDocsRequest(
       `/${encodeURIComponent(documentId)}?includeTabsContent=true`, accessToken, { method: 'GET' },
     );
-    // findTableAt reads a DocsBody, so present the resolved tab as one
     const tabView: DocsBody = { body: { content: resolveTab(updated, tabId).body } };
     table = findTableAt(tabView, index);
 
@@ -746,7 +745,7 @@ export class GoogleDocsTools {
       },
 
       get_document: {
-        description: 'Read the contents of a Google Doc as plain text. Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need — pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
+        description: 'Read the contents of a Google Doc as plain text. Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need; pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
         readOnlyHint: true,
         outputSchema: {
           id: z.string(),
@@ -830,9 +829,8 @@ export class GoogleDocsTools {
               );
             }
 
-            // Fetch from the Docs API: full tab content when structure or a
-            // single tab is requested, otherwise a light tabProperties-only
-            // listing so multi-tab documents are always visible to callers.
+            // Full tab content only when structure or a single tab was asked for;
+            // otherwise a tabProperties-only listing keeps the call light
             const needsDocsContent = Boolean(include_structure || tab_id);
             let doc: any;
             let docsFetchNote: string | undefined;
@@ -843,22 +841,16 @@ export class GoogleDocsTools {
                   : `/${encodeURIComponent(document_id)}?fields=${TAB_LIST_FIELDS}`,
                 accessToken, { method: 'GET' });
             } catch (docsErr) {
-              // Structure and tab-scoped reads genuinely need the doc; a
-              // plain text read should not fail because the listing did.
+              // a plain text read should not fail because the tabs listing did
               if (needsDocsContent) throw docsErr;
               docsFetchNote = 'The tabs listing could not be fetched, so `tabs` and `revisionId` are missing. Retry if you need them.';
             }
 
-            // Resolving without a tab_id pins structure to the first tab,
-            // matching the tab the mutating tools target by default.
             const resolved = needsDocsContent ? resolveTab(doc, tab_id) : undefined;
             const parsed = resolved ? parseDocumentStructure(resolved.body, include_table_styles === true) : undefined;
 
             let content: string;
             if (resolved && tab_id) {
-              // Per-tab text is rendered from the same structure the indices
-              // come from, so content and indices line up exactly. The Drive
-              // export below cannot be scoped to a tab.
               content = renderStructureText(parsed!.elements);
             } else {
               // Export document as plain text via Drive API; concatenates all
@@ -1077,7 +1069,6 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
-            // Get document to find the end index of the targeted tab
             const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
             const resolved = resolveTab(doc, tab_id);
             const endIndex = endOfBodyIndex(resolved.body);
@@ -1115,7 +1106,7 @@ export class GoogleDocsTools {
       },
 
       replace_text: {
-        description: 'Replace all occurrences of a text string in one tab of a Google Doc — the tab named by tab_id, or the first tab when omitted, matching where the other editing tools write. Use get_document first to see current content and verify the text to replace exists. Use empty new_text to delete occurrences. To replace across every tab of a multi-tab document, call once per tab. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
+        description: 'Replace all occurrences of a text string in one tab of a Google Doc: the tab named by tab_id, or the first tab when omitted, matching where the other editing tools write. Use get_document first to see current content and verify the text to replace exists. Use empty new_text to delete occurrences. To replace across every tab of a multi-tab document, call once per tab. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           occurrencesChanged: z.number(),
@@ -1139,10 +1130,9 @@ export class GoogleDocsTools {
               throw new Error('old_text must be a non-empty string');
             }
 
-            // Unscoped replaceAllText hits ALL tabs, unlike every other
-            // request type (which defaults to the first tab). Pin it to one
-            // explicit tab so this tool writes where the others write. The
-            // listing fetch is tabProperties-only, so it stays light.
+            // Unscoped replaceAllText hits ALL tabs, unlike every other request
+            // type; pin it to one explicit tab so this tool writes where the
+            // others write
             const listing = await makeDocsRequest(`/${encodeURIComponent(document_id)}?fields=${TAB_LIST_FIELDS}`, accessToken, { method: 'GET' });
             const tabs = summarizeTabs(listing.tabs);
             let tabsCriteria: { tabIds: string[] } | undefined;
@@ -1488,7 +1478,6 @@ export class GoogleDocsTools {
             const tableData = normalizeTableData(rows);
             const maxCols = tableData[0].length;
 
-            // Get document to find the end index of the targeted tab
             const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
             const resolved = resolveTab(doc, tab_id);
             const insertIndex = endOfBodyIndex(resolved.body);
@@ -1939,7 +1928,7 @@ export class GoogleDocsTools {
       },
 
       get_document_images: {
-        description: 'Extract all inline images from a Google Doc, across every tab — or from one tab when tab_id is passed. Returns each image as an inline image content block. Use get_document with include_structure=true first to see where images are positioned in the document.',
+        description: 'Extract all inline images from a Google Doc, across every tab, or from one tab when tab_id is passed. Returns each image as an inline image content block. Use get_document with include_structure=true first to see where images are positioned in the document.',
         readOnlyHint: true,
         schema: {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
