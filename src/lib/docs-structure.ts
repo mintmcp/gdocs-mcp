@@ -312,6 +312,19 @@ export function escapeDriveQueryName(name: string | undefined): string | undefin
   return name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
+export function isGoogleServedUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname;
+  return host === 'googleusercontent.com' || host.endsWith('.googleusercontent.com') ||
+    host === 'googleapis.com' || host.endsWith('.googleapis.com');
+}
+
 /**
  * Validate an index range for a Docs body mutation. Throws a descriptive error
  * if the range is invalid. Centralised so all mutating tools that take
