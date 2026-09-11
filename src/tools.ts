@@ -853,10 +853,8 @@ export class GoogleDocsTools {
             if (resolved && tab_id) {
               content = renderStructureText(parsed!.elements);
             } else {
-              // Export document as plain text via Drive API; concatenates all
-              // tabs. Accept-Language pins the export footer (where comment
-              // reactions surface as "X reacted with Y at Z") to the English
-              // template the reaction parser expects.
+              // Accept-Language pins the export footer to the English template
+              // the comment-reaction parser expects
               const exportUrl = `${GOOGLE_DRIVE_API}/files/${encodeURIComponent(document_id)}/export?mimeType=text/plain`;
               const response = await fetch(exportUrl, {
                 headers: {
