@@ -309,7 +309,6 @@ async function makeDocsRequest(
 const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) =>
   wrapDocsOnly(handler, makeDriveRequest);
 
-/** One tab-aware document fetch shared by every handler that edits a resolved tab */
 async function fetchResolvedTab(
   documentId: string,
   accessToken: string,
@@ -838,8 +837,6 @@ export class GoogleDocsTools {
               );
             }
 
-            // Full tab content only when structure or a single tab was asked for;
-            // otherwise a tabProperties-only listing keeps the call light
             const needsDocsContent = Boolean(include_structure || tab_id);
             let doc: any;
             let docsFetchNote: string | undefined;
