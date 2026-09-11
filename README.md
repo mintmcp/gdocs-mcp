@@ -3,7 +3,7 @@
 A hosted MCP server that wraps the Google Docs and Drive APIs, packaged for
 the [MintMCP](https://mintmcp.com) hosted runtime. Speaks streamable HTTP on
 port 8000, reads the per-request user access token from the
-`Authorization: Bearer <token>` header, and exposes 11 tools across document
+`Authorization: Bearer <token>` header, and exposes 14 tools across document
 discovery, reading, editing, commenting, and image extraction.
 
 ## Auth contract
@@ -29,10 +29,10 @@ secrets — there is no per-deployment configuration to inject.
 | `https://www.googleapis.com/auth/drive.file` | Create new docs in a folder |
 | `https://www.googleapis.com/auth/documents` | Read/write document content |
 
-## Tool surface (11 tools)
+## Tool surface (14 tools)
 
 - **Discovery** — `search_documents`
-- **Read** — `get_document` (with optional `include_structure`, `include_comments`, multi-tab summary via `includeTabsContent`), `get_document_images`
+- **Read** — `get_document` (optional `include_structure`, `include_comments`, per-tab reads via `tab_id`), `get_document_images`
 - **Create** — `create_document` (optional initial body, optional parent folder)
 - **Insert / append text** — `insert_text` (index-based), `append_text` (end-of-doc), `append_table` (with reverse-order cell insertion)
 - **Update text** — `replace_text`, `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/link), `update_paragraph_style` (heading level, alignment)
@@ -42,6 +42,14 @@ array when the doc uses Google Docs Tabs, plus a `headings` list and the
 current `revisionId` for optimistic-concurrency-controlled writes via
 `required_revision_id`. Round 2 also added structured `error.details`
 passthrough in `toolErrorResponse` envelopes.
+
+Round 3 added full Tabs support: every editing tool takes an optional
+`tab_id` (the `?tab=` value from a doc URL), `get_document(tab_id)` returns
+that tab's content and editing indices from one source so they always line
+up, and the `tabs` summary is returned on every read. On tabbed documents
+requests always name an explicit tab (defaulting to the first), so
+`replace_text` no longer silently edits every tab. Pure tab helpers live in
+`src/lib/tabs.ts`.
 
 ## Local build & run
 
@@ -56,7 +64,7 @@ MCP requests POST to `/mcp`.
 ## Verifying with curl
 
 ```bash
-# List tools (should return 11).
+# List tools (should return 14).
 curl -s -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
