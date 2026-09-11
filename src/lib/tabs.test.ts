@@ -7,6 +7,7 @@ import {
   endOfBodyIndex,
   renderStructureText,
   resolveTab,
+  tabsCriteriaFor,
   unknownTabError,
 } from './tabs.js';
 
@@ -160,5 +161,29 @@ describe('unknownTabError', () => {
   it('mentions the URL param so agents can self-correct', () => {
     const err = unknownTabError('t.x', [{ tabId: 't.0', title: 'Main' }]);
     expect(err.message).toMatch(/\?tab=/);
+  });
+});
+
+describe('tabsCriteriaFor', () => {
+  const tabs = [{ tabId: 't.0', title: 'One' }, { tabId: 't.1', title: 'Two' }];
+
+  it('returns no criteria for an untabbed document', () => {
+    expect(tabsCriteriaFor([])).toBeUndefined();
+  });
+
+  it('rejects a tab_id on an untabbed document', () => {
+    expect(() => tabsCriteriaFor([], 't.0')).toThrow(/has no tabs/);
+  });
+
+  it('pins to the first tab when tab_id is omitted', () => {
+    expect(tabsCriteriaFor(tabs)).toEqual({ tabIds: ['t.0'] });
+  });
+
+  it('pins to the requested tab', () => {
+    expect(tabsCriteriaFor(tabs, 't.1')).toEqual({ tabIds: ['t.1'] });
+  });
+
+  it('lists the available tabs for an unknown tab_id', () => {
+    expect(() => tabsCriteriaFor(tabs, 't.nope')).toThrow(/t\.0 \(One\).*t\.1 \(Two\)/);
   });
 });

@@ -64,6 +64,20 @@ export function resolveTab(doc: any, tabId?: string): ResolvedTab {
   };
 }
 
+/**
+ * Unscoped replaceAllText hits ALL tabs, unlike every other request type;
+ * pin it to one explicit tab so replace writes where the other tools write
+ */
+export function tabsCriteriaFor(tabs: TabSummary[], tabId?: string): { tabIds: string[] } | undefined {
+  if (tabs.length === 0) {
+    if (tabId) throw unknownTabError(tabId, tabs);
+    return undefined;
+  }
+  const target = tabId ?? tabs[0].tabId;
+  if (!tabs.some((t) => t.tabId === target)) throw unknownTabError(target, tabs);
+  return { tabIds: [target] };
+}
+
 export function docLocation(index: number, tabId?: string): { index: number; tabId?: string } {
   return { index, ...(tabId ? { tabId } : {}) };
 }

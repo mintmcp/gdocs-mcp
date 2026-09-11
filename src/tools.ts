@@ -63,7 +63,7 @@ import {
   endOfBodyIndex,
   renderStructureText,
   resolveTab,
-  unknownTabError,
+  tabsCriteriaFor,
   type ResolvedTab,
 } from "./lib/tabs.js";
 
@@ -1133,21 +1133,8 @@ export class GoogleDocsTools {
               throw new Error('old_text must be a non-empty string');
             }
 
-            // Unscoped replaceAllText hits ALL tabs, unlike every other request
-            // type; pin it to one explicit tab so this tool writes where the
-            // others write
             const listing = await makeDocsRequest(`/${encodeURIComponent(document_id)}?fields=${TAB_LIST_FIELDS}`, accessToken, { method: 'GET' });
-            const tabs = summarizeTabs(listing.tabs);
-            let tabsCriteria: { tabIds: string[] } | undefined;
-            if (tabs.length > 0) {
-              const target = tab_id ?? tabs[0].tabId;
-              if (!tabs.some((t) => t.tabId === target)) {
-                throw unknownTabError(target, tabs);
-              }
-              tabsCriteria = { tabIds: [target] };
-            } else if (tab_id) {
-              throw unknownTabError(tab_id, tabs);
-            }
+            const tabsCriteria = tabsCriteriaFor(summarizeTabs(listing.tabs), tab_id);
 
             const writeControl = buildWriteControl(required_revision_id);
             const result = await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
@@ -1679,10 +1666,10 @@ export class GoogleDocsTools {
               throw new Error('At least one style property must be provided (background_color, border, border_top, border_right, border_bottom, border_left, content_alignment).');
             }
 
-            const { resolved, tabBody: doc } = await fetchResolvedTab(document_id, accessToken, tab_id);
-            const element = findTableStartingAt(doc, table_start_index);
+            const { resolved, tabBody } = await fetchResolvedTab(document_id, accessToken, tab_id);
+            const element = findTableStartingAt(tabBody, table_start_index);
             if (!element) {
-              const tables = (doc?.body?.content ?? []).filter((c) => c.table);
+              const tables = (tabBody.body?.content ?? []).filter((c) => c.table);
               // An index inside a table is a nested table, which the Docs API does not
               // expose as its own element, so no lookup can ever reach it.
               const enclosing = tables.find(
@@ -1753,7 +1740,7 @@ export class GoogleDocsTools {
                 },
               }],
             };
-            const writeControl = buildWriteControl(doc.revisionId);
+            const writeControl = buildWriteControl(tabBody.revisionId);
             if (writeControl) {
               body.writeControl = writeControl;
             }
@@ -1774,7 +1761,7 @@ export class GoogleDocsTools {
               message: `Styled ${requested} cell(s) (${fields.join(', ')}) in the table at index ${table_start_index}`,
             };
             const warnings: string[] = [];
-            if (!doc.revisionId) {
+            if (!tabBody.revisionId) {
               warnings.push(
                 'The document reported no revision, so this write could not be pinned to the revision it was validated against. ' +
                 'A concurrent edit could have changed the table between the check and the write.'
