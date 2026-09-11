@@ -56,7 +56,6 @@ MCP requests POST to `/mcp`.
 ## Verifying with curl
 
 ```bash
-# List tools (should return 14).
 curl -s -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
