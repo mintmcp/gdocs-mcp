@@ -11,6 +11,7 @@ import {
   escapeDriveQueryName,
   extractHeadings,
   findLetterByContent,
+  isGoogleServedUrl,
   parseDocumentStructure,
   parseExportArtifacts,
   summarizeTabs,
@@ -1884,7 +1885,7 @@ export class GoogleDocsTools {
             for (const objectId of objectIds) {
               const obj = inlineObjects[objectId];
               const imageProps = obj?.inlineObjectProperties?.embeddedObject;
-              const imageUrl = imageProps?.imageProperties?.sourceUri || imageProps?.imageProperties?.contentUri;
+              const imageUrl = imageProps?.imageProperties?.contentUri || imageProps?.imageProperties?.sourceUri;
               const title = imageProps?.title || '';
               const description = imageProps?.description || '';
 
@@ -1892,7 +1893,7 @@ export class GoogleDocsTools {
 
               try {
                 const response = await fetch(imageUrl, {
-                  headers: { 'Authorization': `Bearer ${accessToken}` },
+                  headers: isGoogleServedUrl(imageUrl) ? { 'Authorization': `Bearer ${accessToken}` } : {},
                 });
 
                 if (!response.ok) {

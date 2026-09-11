@@ -13,6 +13,7 @@ import {
   summarizeTabs,
   validateIndexRange,
   validateInsertIndex,
+  isGoogleServedUrl,
 } from './docs-structure.js';
 
 /**
@@ -394,5 +395,21 @@ describe('findLetterByContent', () => {
     const map = new Map([['a', 'Hello']]);
     expect(findLetterByContent(map, '')).toBeUndefined();
     expect(findLetterByContent(map, 'nope')).toBeUndefined();
+  });
+});
+
+describe('isGoogleServedUrl', () => {
+  it('allows Google-served image and API hosts', () => {
+    expect(isGoogleServedUrl('https://lh7-us.googleusercontent.com/docsz/abc')).toBe(true);
+    expect(isGoogleServedUrl('https://googleusercontent.com/x')).toBe(true);
+    expect(isGoogleServedUrl('https://docs.googleapis.com/v1/x')).toBe(true);
+  });
+
+  it('refuses third-party hosts, lookalikes and non-https schemes', () => {
+    expect(isGoogleServedUrl('https://evil.example/x.png')).toBe(false);
+    expect(isGoogleServedUrl('https://evilgoogleusercontent.com/x')).toBe(false);
+    expect(isGoogleServedUrl('https://googleusercontent.com.evil.example/x')).toBe(false);
+    expect(isGoogleServedUrl('http://lh7-us.googleusercontent.com/x')).toBe(false);
+    expect(isGoogleServedUrl('not a url')).toBe(false);
   });
 });
