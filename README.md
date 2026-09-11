@@ -43,14 +43,6 @@ current `revisionId` for optimistic-concurrency-controlled writes via
 `required_revision_id`. Round 2 also added structured `error.details`
 passthrough in `toolErrorResponse` envelopes.
 
-Round 3 added full Tabs support: every editing tool takes an optional
-`tab_id` (the `?tab=` value from a doc URL), `get_document(tab_id)` returns
-that tab's content and editing indices from one source so they always line
-up, and the `tabs` summary is returned on every read. On tabbed documents
-requests always name an explicit tab (defaulting to the first), so
-`replace_text` no longer silently edits every tab. Pure tab helpers live in
-`src/lib/tabs.ts`.
-
 ## Local build & run
 
 ```bash
