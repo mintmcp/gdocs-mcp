@@ -3,7 +3,7 @@
 A hosted MCP server that wraps the Google Docs and Drive APIs, packaged for
 the [MintMCP](https://mintmcp.com) hosted runtime. Speaks streamable HTTP on
 port 8000, reads the per-request user access token from the
-`Authorization: Bearer <token>` header, and exposes 11 tools across document
+`Authorization: Bearer <token>` header, and exposes 14 tools across document
 discovery, reading, editing, commenting, and image extraction.
 
 ## Auth contract
@@ -29,10 +29,10 @@ secrets — there is no per-deployment configuration to inject.
 | `https://www.googleapis.com/auth/drive.file` | Create new docs in a folder |
 | `https://www.googleapis.com/auth/documents` | Read/write document content |
 
-## Tool surface (11 tools)
+## Tool surface (14 tools)
 
 - **Discovery** — `search_documents`
-- **Read** — `get_document` (with optional `include_structure`, `include_comments`, multi-tab summary via `includeTabsContent`), `get_document_images`
+- **Read** — `get_document` (optional `include_structure`, `include_comments`, per-tab reads via `tab_id`), `get_document_images`
 - **Create** — `create_document` (optional initial body, optional parent folder)
 - **Insert / append text** — `insert_text` (index-based), `append_text` (end-of-doc), `append_table` (with reverse-order cell insertion)
 - **Update text** — `replace_text`, `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/link), `update_paragraph_style` (heading level, alignment)
@@ -56,7 +56,6 @@ MCP requests POST to `/mcp`.
 ## Verifying with curl
 
 ```bash
-# List tools (should return 11).
 curl -s -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
