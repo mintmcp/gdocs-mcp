@@ -64,6 +64,7 @@ import {
   renderStructureText,
   resolveTab,
   unknownTabError,
+  type ResolvedTab,
 } from "./lib/tabs.js";
 
 const GOOGLE_DRIVE_API = 'https://www.googleapis.com/drive/v3';
@@ -308,6 +309,17 @@ async function makeDocsRequest(
 const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) =>
   wrapDocsOnly(handler, makeDriveRequest);
 
+/** One tab-aware document fetch shared by every handler that edits a resolved tab */
+async function fetchResolvedTab(
+  documentId: string,
+  accessToken: string,
+  tabId?: string,
+): Promise<{ doc: any; resolved: ResolvedTab; tabBody: DocsBody }> {
+  const doc = await makeDocsRequest(`/${encodeURIComponent(documentId)}?includeTabsContent=true`, accessToken, { method: 'GET' });
+  const resolved = resolveTab(doc, tabId);
+  return { doc, resolved, tabBody: { revisionId: doc.revisionId, body: { content: resolved.body } } };
+}
+
 interface InsertedTable {
   rows: number;
   columns: number;
@@ -357,11 +369,8 @@ async function insertTableAt(
 
   let table: { startIndex: number; endIndex: number } | undefined;
   try {
-    const updated = await makeDocsRequest(
-      `/${encodeURIComponent(documentId)}?includeTabsContent=true`, accessToken, { method: 'GET' },
-    );
-    const tabView: DocsBody = { body: { content: resolveTab(updated, tabId).body } };
-    table = findTableAt(tabView, index);
+    const { tabBody } = await fetchResolvedTab(documentId, accessToken, tabId);
+    table = findTableAt(tabBody, index);
 
     if (table) {
       await makeDocsRequest(`/${encodeURIComponent(documentId)}:batchUpdate`, accessToken, {
@@ -745,7 +754,7 @@ export class GoogleDocsTools {
       },
 
       get_document: {
-        description: 'Read the contents of a Google Doc as plain text. Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need; pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
+        description: 'Read the contents of a Google Doc as plain text. Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need; pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable; comment threads are document-level, so ones anchored in other tabs are still returned but without `anchor_offset`. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
         readOnlyHint: true,
         outputSchema: {
           id: z.string(),
@@ -850,8 +859,8 @@ export class GoogleDocsTools {
             const parsed = resolved ? parseDocumentStructure(resolved.body, include_table_styles === true) : undefined;
 
             let content: string;
-            if (resolved && tab_id) {
-              content = renderStructureText(parsed!.elements);
+            if (parsed && tab_id) {
+              content = renderStructureText(parsed.elements);
             } else {
               // Accept-Language pins the export footer to the English template
               // the comment-reaction parser expects
@@ -896,9 +905,9 @@ export class GoogleDocsTools {
 
             const notes: string[] = [];
             if (docsFetchNote) notes.push(docsFetchNote);
-            if (parsed && include_structure) {
+            if (parsed && resolved && include_structure) {
               output.structure = parsed.elements;
-              output.headings = extractHeadings(resolved!.body);
+              output.headings = extractHeadings(resolved.body);
               if (parsed.tablesWithoutCells > 0) {
                 notes.push(`${parsed.tablesWithoutCells} table(s) report dimensions without cell contents because the document exhausted the structure budget for table cells. Their text, if any, is in \`content\`.`);
               }
@@ -1067,8 +1076,7 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
-            const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
-            const resolved = resolveTab(doc, tab_id);
+            const { resolved } = await fetchResolvedTab(document_id, accessToken, tab_id);
             const endIndex = endOfBodyIndex(resolved.body);
 
             // Insert text at the end, optionally clearing inherited formatting
@@ -1476,8 +1484,7 @@ export class GoogleDocsTools {
             const tableData = normalizeTableData(rows);
             const maxCols = tableData[0].length;
 
-            const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
-            const resolved = resolveTab(doc, tab_id);
+            const { resolved } = await fetchResolvedTab(document_id, accessToken, tab_id);
             const insertIndex = endOfBodyIndex(resolved.body);
 
             // Build requests: first insert empty table, then populate cells in reverse order
@@ -1518,8 +1525,8 @@ export class GoogleDocsTools {
             let tableStartIndexVerified = false;
             if (clear_inherited_formatting !== false) {
               try {
-                const updatedDoc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
-                const allTables = resolveTab(updatedDoc, resolved.tabId).body.filter((el: any) => el.table);
+                const { resolved: updated } = await fetchResolvedTab(document_id, accessToken, resolved.tabId);
+                const allTables = updated.body.filter((el: any) => el.table);
                 const candidates = allTables.filter((t: any) =>
                   typeof t.startIndex === 'number' &&
                   typeof t.endIndex === 'number' &&
@@ -1601,11 +1608,8 @@ export class GoogleDocsTools {
             const tableData = normalizeTableData(rows, columns);
 
             if (allow_nested !== true) {
-              const doc = await makeDocsRequest(
-                `/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' },
-              );
-              const tabView: DocsBody = { body: { content: resolveTab(doc, tab_id).body } };
-              const refusal = nestingRefusal(tabView, index);
+              const { tabBody } = await fetchResolvedTab(document_id, accessToken, tab_id);
+              const refusal = nestingRefusal(tabBody, index);
               if (refusal) {
                 throw new Error(refusal);
               }
@@ -1678,11 +1682,7 @@ export class GoogleDocsTools {
               throw new Error('At least one style property must be provided (background_color, border, border_top, border_right, border_bottom, border_left, content_alignment).');
             }
 
-            const fetched = await makeDocsRequest(
-              `/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' },
-            );
-            const resolved = resolveTab(fetched, tab_id);
-            const doc: DocsBody = { revisionId: fetched.revisionId, body: { content: resolved.body } };
+            const { resolved, tabBody: doc } = await fetchResolvedTab(document_id, accessToken, tab_id);
             const element = findTableStartingAt(doc, table_start_index);
             if (!element) {
               const tables = (doc?.body?.content ?? []).filter((c) => c.table);
@@ -1936,10 +1936,8 @@ export class GoogleDocsTools {
           try {
             const { accessToken } = context;
 
-            const doc = await makeDocsRequest(`/${encodeURIComponent(document_id)}?includeTabsContent=true`, accessToken, { method: 'GET' });
-            const inlineObjects = tab_id
-              ? resolveTab(doc, tab_id).inlineObjects
-              : collectInlineObjects(doc);
+            const { doc, resolved } = await fetchResolvedTab(document_id, accessToken, tab_id);
+            const inlineObjects = tab_id ? resolved.inlineObjects : collectInlineObjects(doc);
             const objectIds = Object.keys(inlineObjects);
 
             if (objectIds.length === 0) {

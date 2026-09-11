@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import { parseDocumentStructure } from './docs-structure.js';
 import {
   collectInlineObjects,
   docLocation,
   docRange,
   endOfBodyIndex,
   renderStructureText,
-  renderTabText,
   resolveTab,
   unknownTabError,
 } from './tabs.js';
@@ -118,9 +118,10 @@ describe('endOfBodyIndex', () => {
   });
 });
 
-describe('renderStructureText / renderTabText', () => {
+describe('renderStructureText', () => {
   it('concatenates paragraph text', () => {
-    expect(renderTabText([para('one\n', 1, 5), para('two\n', 5, 9)])).toBe('one\ntwo\n');
+    const parsed = parseDocumentStructure([para('one\n', 1, 5), para('two\n', 5, 9)]);
+    expect(renderStructureText(parsed.elements)).toBe('one\ntwo\n');
   });
 
   it('renders tables as tab-separated rows', () => {

@@ -1,7 +1,6 @@
 /** Pure helpers for Google Docs Tabs: tab resolution, tab-aware Location/Range objects, per-tab text */
 
 import {
-  parseDocumentStructure,
   summarizeTabs,
   type StructureElement,
   type TabSummary,
@@ -100,10 +99,6 @@ export function renderStructureText(elements: StructureElement[]): string {
     }
   }
   return out;
-}
-
-export function renderTabText(body: any[]): string {
-  return renderStructureText(parseDocumentStructure(body).elements);
 }
 
 /**
