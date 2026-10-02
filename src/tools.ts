@@ -77,6 +77,7 @@ import {
   makeDocsRequest,
 } from './lib/google.js';
 import { attachLabelsMeta } from './lib/driveLabels.js';
+import { log, errorFields } from "./lib/log.js";
 
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
 
@@ -134,7 +135,7 @@ async function importMarkdownDoc(
       body: upload.body,
     });
   } catch (err) {
-    console.error(`[MD_IMPORT] fail status=${err instanceof GoogleApiError ? err.status : 'none'} msg=${err instanceof Error ? err.message : String(err)}`);
+    log("error", "markdown_import_failed", errorFields(err));
     if (!isConversionRefusal(err)) throw err;
     throw new Error(
       `Drive could not convert this markdown into a Google Doc. Retry with body_format "plain" ` +
@@ -144,6 +145,17 @@ async function importMarkdownDoc(
 
   assertNativeDoc(file, 'the upload', `https://drive.google.com/file/d/${file.id}/view`);
   return file;
+}
+
+// The `code` for an error that isn't Google's. A failed fetch is a TypeError like
+// a bug in our code, so the system code on its cause (ECONNRESET, ENOTFOUND,
+// UND_ERR_CONNECT_TIMEOUT) comes first. A plain Error is a message we wrote,
+// usually a rejected input, so it gets no code; any other class (TypeError,
+// RangeError) points at a bug
+function errorClass(err: Error): string | undefined {
+  const cause = (err as { cause?: { code?: unknown } }).cause;
+  if (typeof cause?.code === "string") return cause.code;
+  return err.name === "Error" ? undefined : err.name;
 }
 
 /**
@@ -164,7 +176,7 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
       api: err.api,
     };
   } else if (err instanceof Error) {
-    payload = { error: err.message };
+    payload = { error: err.message, code: errorClass(err) };
   } else {
     payload = { error: String(err) };
   }
@@ -175,9 +187,21 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
 }
 
 
-/** Refuse writes against Word uploads. Bound here so the wrapper stays pure. */
-const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) =>
-  wrapDocsOnly(handler, makeDriveRequest);
+/**
+ * Refuse writes against Word uploads. Bound here so the wrapper stays pure.
+ * Its Drive lookup and refusal run before the handler's own try, so their
+ * throws go through toolErrorResponse like every other failure.
+ */
+const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) => {
+  const guarded = wrapDocsOnly(handler, makeDriveRequest);
+  return async (args: any, context: any) => {
+    try {
+      return await guarded(args, context);
+    } catch (err) {
+      return toolErrorResponse(err);
+    }
+  };
+};
 
 async function fetchResolvedTab(
   documentId: string,
@@ -251,10 +275,7 @@ async function insertTableAt(
     }
   } catch (error: any) {
     // Google's error text is untrusted once the model reads it, so it stays in the log.
-    console.error(
-      `[gdocs-hosted] table style fail phase=${table ? 'style' : 'refetch'} ` +
-      `status=${error?.status ?? 'none'} kind=${error?.name ?? 'unknown'}`,
-    );
+    log("error", "table_style_failed", { phase: table ? "style" : "refetch", ...errorFields(error) });
     return {
       ...created,
       startIndexVerified: Boolean(table),
@@ -263,9 +284,7 @@ async function insertTableAt(
   }
 
   if (!table) {
-    console.error(
-      `[gdocs-hosted] table style fail phase=lookup msg=table not found at ${tableStartFor(index)}`,
-    );
+    log("error", "table_style_failed", { phase: "lookup", tableStartIndex: tableStartFor(index) });
     return { ...created, warning: styleFailureWarning(false) };
   }
 
@@ -1745,7 +1764,8 @@ export class GoogleDocsTools {
                 }
               );
             } catch (err) {
-              console.error(`[MD_CONVERT] fail status=${err instanceof GoogleApiError ? err.status : 'none'} mime=${sourceMime} msg=${err instanceof Error ? err.message : String(err)}`);
+              // base type only: a stored mimeType can carry uploader-written parameters
+              log("error", "markdown_convert_failed", { ...errorFields(err), mime: sourceMime.split(";")[0].trim() });
               // Only a refusal is about the file; anything else would send the user
               // off re-uploading a document that was never the problem.
               if (!isConversionRefusal(err)) throw err;

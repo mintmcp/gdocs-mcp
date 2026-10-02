@@ -18,6 +18,7 @@ import {
   WordTooLargeError,
   type WordText,
 } from './wordText.js';
+import { log, errorFields } from "./log.js";
 
 export const NATIVE_DOC_MIME = 'application/vnd.google-apps.document';
 
@@ -173,17 +174,16 @@ export async function readWordUpload(
     const word = await extractWordText(bytes, {
       expectedFormat: source.mimeType === LEGACY_DOC_MIME ? 'doc' : 'docx',
     });
-    console.log(
-      `[gdocs-hosted] word read ok format=${word.format} bytes=${bytes.byteLength} ` +
-      `chars=${word.chars} truncated=${word.truncated} ms=${Date.now() - started}`,
-    );
+    log("info", "word_read", {
+      format: word.format,
+      bytes: bytes.byteLength,
+      chars: word.chars,
+      truncated: word.truncated,
+      ms: Date.now() - started,
+    });
     return word;
   } catch (err) {
-    const detail = err instanceof WordInvalidError && err.detail ? ` detail=${err.detail}` : '';
-    console.error(
-      `[gdocs-hosted] word read fail bytes=${bytes?.byteLength ?? 0} ms=${Date.now() - started} ` +
-      `kind=${err instanceof Error ? err.name : 'unknown'}${detail}`,
-    );
+    log("error", "word_read_failed", { ...errorFields(err), bytes: bytes?.byteLength ?? 0, ms: Date.now() - started });
     const message = wordErrorMessage(err, source.name, source.webViewLink);
     throw message ? new Error(message) : err;
   }
