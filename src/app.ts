@@ -6,7 +6,7 @@ import { jsonRpcError, messagesOf, responseIdFor } from "./jsonrpc.js";
 
 export const MCP_PATH = "/mcp";
 
-export function createApp() {
+export function createApp(granted: Set<string> | null) {
   const app = express();
   app.use(express.json({ limit: "10mb" }));
 
@@ -21,7 +21,7 @@ export function createApp() {
   // time, so a shared one rejects overlapping requests with
   // "Already connected to a transport"
   app.post(MCP_PATH, requireAccessToken, async (req: Request, res: Response) => {
-    const server = createServer();
+    const server = createServer(granted);
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });

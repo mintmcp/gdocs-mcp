@@ -1,30 +1,76 @@
 name: Deploy to Fly
 
+# Branch-driven, not tag-driven: a PR deploys staging, merging to main ships prod
 on:
   push:
     branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
-    inputs:
-      env:
-        description: "Which environment to deploy to"
-        type: choice
-        options: [staging, prod]
-        default: prod
 
 permissions:
   id-token: write
   contents: read
 
+concurrency:
+  # Prod deploys never cancel each other. A second push to the same PR
+  # supersedes the first, since only the latest commit is worth testing
+  group: deploy-${{ github.event_name == 'push' && 'prod' || github.head_ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  deploy:
+  targets:
     runs-on: ubuntu-latest
-    env:
-      TARGET_ENV: ${{ inputs.env || 'prod' }}
+    # Fork PRs run without OIDC credentials, so skip instead of failing on auth
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
 
+      - id: pick
+        env:
+          WANT: ${{ github.event_name == 'push' && 'prod' || 'staging' }}
+        run: |
+          MATRIX=$(yq -o=json -I0 '.' deployments.yml | jq -c --arg want "$WANT" \
+            '{include: [.[] | select(.live and .env == $want)]}')
+
+          if [ "$(jq '.include | length' <<<"$MATRIX")" -eq 0 ]; then
+            echo "error: no live '$WANT' entry in deployments.yml" >&2
+            exit 2
+          fi
+
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: targets
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.targets.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # PROFILE selects the scope set from src/scopes.ts; an unknown name
+      # crashes at boot and fails the deploy
+      - run: |
+          {
+            echo ""
+            echo "[env]"
+            echo "  PROFILE = \"$(jq -r '.profile' <<<'${{ toJson(matrix) }}')\""
+          } >> fly.toml
+
+      - run: |
+          {
+            echo "Deploying **${{ matrix.env }}** to \`${{ matrix.app }}\`"
+            echo ""
+            echo "https://${{ matrix.app }}.fly.dev/mcp"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: mintmcp/mint-fly-deploy@main
         with:
-          env: ${{ env.TARGET_ENV }}
-          fly-app: ${{ env.TARGET_ENV == 'prod' && 'gdocs-mintmcp' || 'gdocs-mintmcp-staging' }}
+          env: ${{ matrix.env }}
+          fly-app: ${{ matrix.app }}
           aws-role-arn: arn:aws:iam::519578939119:role/github-actions-fly-deploy

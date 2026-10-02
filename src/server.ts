@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { GoogleDocsTools } from "./tools.js";
+import { isToolGranted } from "./scopes.js";
 import { log, truncate } from "./lib/log.js";
 
 const SERVER_NAME = "Google Docs";
@@ -9,10 +10,26 @@ const SERVER_VERSION = "0.1.0";
 // each time would put that cost on every call
 const TOOLS = Object.entries(GoogleDocsTools.getTools()) as Array<[string, any]>;
 
+export function logToolSurface(granted: Set<string> | null): void {
+  const registered: string[] = [];
+  const skipped: string[] = [];
+  for (const [toolName, t] of TOOLS) {
+    (isToolGranted(t.handler?.scope, granted) ? registered : skipped).push(toolName);
+  }
+
+  log("info", "tool_surface", {
+    scopes: granted === null ? "unrestricted" : [...granted],
+    tools: registered,
+    withheld: skipped,
+  });
+}
+
 // Handlers return failures as isError results, so without this a failed call
 // leaves no trace in the server logs. Only fields that can't hold user data are
 // logged; the full message already went back to the client in the tool result.
-// gdrive, gslides, gsheets, gdocs and gmail share this code so they log alike
+// This is a copy: gdrive, gslides, gsheets, gdocs and gmail carry the same code
+// so they log the same fields. gslides-mcp src/server.ts is the reference;
+// change it there first, then copy it to the other four
 export function logToolErrors(
   toolName: string,
   handler: (args: any) => Promise<any>,
@@ -58,10 +75,12 @@ function errorCodes(result: any): { status?: number; reason?: string; code?: str
   };
 }
 
-export function createServer(): McpServer {
+export function createServer(granted: Set<string> | null): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
   for (const [toolName, t] of TOOLS) {
+    if (!isToolGranted(t.handler?.scope, granted)) continue;
+
     server.registerTool(
       toolName,
       {
