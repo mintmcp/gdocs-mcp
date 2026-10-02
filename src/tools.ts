@@ -284,7 +284,7 @@ async function insertTableAt(
   }
 
   if (!table) {
-    log("error", "table_style_failed", { phase: "lookup" });
+    log("error", "table_style_failed", { phase: "lookup", tableStartIndex: tableStartFor(index) });
     return { ...created, warning: styleFailureWarning(false) };
   }
 
@@ -1764,7 +1764,8 @@ export class GoogleDocsTools {
                 }
               );
             } catch (err) {
-              log("error", "markdown_convert_failed", { ...errorFields(err), mime: sourceMime });
+              // base type only: a stored mimeType can carry uploader-written parameters
+              log("error", "markdown_convert_failed", { ...errorFields(err), mime: sourceMime.split(";")[0].trim() });
               // Only a refusal is about the file; anything else would send the user
               // off re-uploading a document that was never the problem.
               if (!isConversionRefusal(err)) throw err;
