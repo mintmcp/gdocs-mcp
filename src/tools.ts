@@ -186,9 +186,21 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
 }
 
 
-/** Refuse writes against Word uploads. Bound here so the wrapper stays pure. */
-const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) =>
-  wrapDocsOnly(handler, makeDriveRequest);
+/**
+ * Refuse writes against Word uploads. Bound here so the wrapper stays pure.
+ * Its Drive lookup and refusal run before the handler's own try, so their
+ * throws go through toolErrorResponse like every other failure.
+ */
+const docsOnly = <T,>(handler: (args: any, context: any) => Promise<T>) => {
+  const guarded = wrapDocsOnly(handler, makeDriveRequest);
+  return async (args: any, context: any) => {
+    try {
+      return await guarded(args, context);
+    } catch (err) {
+      return toolErrorResponse(err);
+    }
+  };
+};
 
 async function fetchResolvedTab(
   documentId: string,

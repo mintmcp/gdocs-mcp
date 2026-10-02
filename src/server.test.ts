@@ -69,7 +69,7 @@ describe("tool error logging over MCP", () => {
     });
 
     expect(result.isError).toBe(true);
-    expect(JSON.stringify(result.content)).not.toContain('\\"code\\"');
+    expect(JSON.parse((result.content as any)[0].text)).not.toHaveProperty("code");
     const logged = lines.filter((l) => l.includes('"tool_call_error"'));
     expect(logged).toHaveLength(1);
     const { ts, ...record } = JSON.parse(logged[0]);
@@ -162,5 +162,37 @@ describe("logToolSurface", () => {
     const record = JSON.parse(String(written.mock.calls[0][0]));
     expect(record).toMatchObject({ level: "info", event: "tool_surface", scopes: "unrestricted", withheld: [] });
     expect(record.tools.length).toBeGreaterThan(0);
+  });
+});
+
+describe("Word-upload refusal on a write tool", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("returns the JSON error and logs it as a call error, without the file name", async () => {
+    const meta = {
+      name: `${SECRET}.docx`,
+      mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      webViewLink: "https://drive.google.com/file/d/w1/view",
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(meta), { status: 200, headers: { "content-type": "application/json" } })),
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await createServer(null).connect(serverTransport);
+    await client.connect(clientTransport);
+    const written = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    const result = await requestContext.run({ accessToken: "tok" } as any, () =>
+      client.callTool({ name: "append_text", arguments: { document_id: "w1", text: "x" } }),
+    );
+
+    expect(result.isError).toBe(true);
+    expect(JSON.parse((result.content as any)[0].text).error).toContain(SECRET);
+    expect(records(written)).toEqual([{ level: "warn", event: "tool_call_error", tool: "append_text" }]);
   });
 });
