@@ -10,8 +10,6 @@
   live: true
   profile: standard # drive.readonly + drive.file + documents
 
-# Pair the labels app with the write-grant gate middleware and an approval rule on the
-# Drive connector's set_file_label
 - app: gdocs-mintmcp-labels
   env: prod
   live: true
