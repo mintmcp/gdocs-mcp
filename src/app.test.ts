@@ -2,13 +2,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { createApp, MCP_PATH } from './app.js';
+import { grantedScopes } from './scopes.js';
 
 const realFetch = globalThis.fetch;
 let httpServer: Server;
 let url: string;
 
 beforeAll(async () => {
-  httpServer = createApp().listen(0, '127.0.0.1');
+  httpServer = createApp(grantedScopes()).listen(0, '127.0.0.1');
   await new Promise((resolve) => httpServer.once('listening', resolve));
   url = `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}${MCP_PATH}`;
 });
