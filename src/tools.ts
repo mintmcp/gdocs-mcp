@@ -243,7 +243,7 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
       api: err.api,
     };
   } else if (err instanceof Error) {
-    payload = { error: err.message };
+    payload = { error: err.message, code: err.name };
   } else {
     payload = { error: String(err) };
   }
