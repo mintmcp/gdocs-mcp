@@ -225,6 +225,13 @@ async function importMarkdownDoc(
   return file;
 }
 
+// A failed fetch is a TypeError like a bug in our code; the system code on its
+// cause (ECONNRESET, ENOTFOUND, UND_ERR_CONNECT_TIMEOUT) tells them apart
+function errorClass(err: Error): string {
+  const cause = (err as { cause?: { code?: unknown } }).cause;
+  return typeof cause?.code === "string" ? cause.code : err.name;
+}
+
 /**
  * Format any thrown error into a structured MCP error response. Handlers MUST
  * wrap their bodies in try/catch and route caught errors through this so
@@ -243,7 +250,7 @@ function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'; text:
       api: err.api,
     };
   } else if (err instanceof Error) {
-    payload = { error: err.message, code: err.name };
+    payload = { error: err.message, code: errorClass(err) };
   } else {
     payload = { error: String(err) };
   }
