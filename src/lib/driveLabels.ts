@@ -1,5 +1,6 @@
 import { makeDriveRequest } from './google.js';
 import { grantedScopes, SCOPES } from '../scopes.js';
+import { log, errorFields } from "./log.js";
 
 const DRIVE_LABELS_API = 'https://drivelabels.googleapis.com/v2';
 const MAX_LABEL_PAGES = 10; // 1000 labels at maxResults=100, far above Drive's per-file limit
@@ -104,17 +105,17 @@ export async function getFileLabels(
     }
     if (pageToken) {
       error = 'label read failed';
-      console.warn(`getFileLabels: page cap hit fileId=${fileId}`);
+      log("warn", "label_page_cap_hit");
     }
   } catch (err: any) {
     error = 'label read failed';
-    console.warn(`getFileLabels: label read failed fileId=${fileId} error=${err?.message}`);
+    log("warn", "label_read_failed", errorFields(err));
   }
 
   const withIds = wire.filter((l): l is WireLabel & { id: string } => {
     if (l.id) return true;
     if (!error) error = 'incomplete label resolution';
-    console.warn(`getFileLabels: applied label without id fileId=${fileId}`);
+    log("warn", "label_without_id");
     return false;
   });
 
@@ -127,10 +128,7 @@ export async function getFileLabels(
     const info = lookup.status === 'fulfilled' ? lookup.value : undefined;
     if (!info) {
       if (!error) error = 'incomplete label resolution';
-      console.warn(
-        `getFileLabels: label lookup failed fileId=${fileId} labelId=${label.id} ` +
-        `error=${(lookup as PromiseRejectedResult).reason?.message}`
-      );
+      log("warn", "label_lookup_failed", errorFields((lookup as PromiseRejectedResult).reason));
     }
 
     const values: AppliedLabelValue[] = [];
@@ -176,7 +174,7 @@ export async function getFileLabels(
 
     if (unresolvedChoice) {
       if (!error) error = 'incomplete label resolution';
-      console.warn(`getFileLabels: unresolved choice fileId=${fileId} labelId=${label.id}`);
+      log("warn", "label_choice_unresolved");
     }
 
     return {
@@ -206,7 +204,7 @@ export function fetchLabelsMeta(fileId: string, accessToken: string): Promise<Re
       ...(error ? { labelsError: error } : {}),
     }))
     .catch((err) => {
-      console.warn(`fetchLabelsMeta: degraded fileId=${fileId} error=${err?.message}`);
+      log("warn", "labels_meta_degraded", errorFields(err));
       return { applied: [], labelsError: 'label read failed' };
     });
 }

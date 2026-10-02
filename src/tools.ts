@@ -77,6 +77,7 @@ import {
   makeDocsRequest,
 } from './lib/google.js';
 import { attachLabelsMeta } from './lib/driveLabels.js';
+import { log, errorFields } from "./lib/log.js";
 
 const MAX_IMAGE_SIZE = 20 * 1024 * 1024; // 20MB
 
@@ -134,7 +135,7 @@ async function importMarkdownDoc(
       body: upload.body,
     });
   } catch (err) {
-    console.error(`[MD_IMPORT] fail status=${err instanceof GoogleApiError ? err.status : 'none'} msg=${err instanceof Error ? err.message : String(err)}`);
+    log("error", "markdown_import_failed", errorFields(err));
     if (!isConversionRefusal(err)) throw err;
     throw new Error(
       `Drive could not convert this markdown into a Google Doc. Retry with body_format "plain" ` +
@@ -274,10 +275,7 @@ async function insertTableAt(
     }
   } catch (error: any) {
     // Google's error text is untrusted once the model reads it, so it stays in the log.
-    console.error(
-      `[gdocs-hosted] table style fail phase=${table ? 'style' : 'refetch'} ` +
-      `status=${error?.status ?? 'none'} kind=${error?.name ?? 'unknown'}`,
-    );
+    log("error", "table_style_failed", { phase: table ? "style" : "refetch", ...errorFields(error) });
     return {
       ...created,
       startIndexVerified: Boolean(table),
@@ -286,9 +284,7 @@ async function insertTableAt(
   }
 
   if (!table) {
-    console.error(
-      `[gdocs-hosted] table style fail phase=lookup msg=table not found at ${tableStartFor(index)}`,
-    );
+    log("error", "table_style_failed", { phase: "lookup" });
     return { ...created, warning: styleFailureWarning(false) };
   }
 
@@ -1768,7 +1764,7 @@ export class GoogleDocsTools {
                 }
               );
             } catch (err) {
-              console.error(`[MD_CONVERT] fail status=${err instanceof GoogleApiError ? err.status : 'none'} mime=${sourceMime} msg=${err instanceof Error ? err.message : String(err)}`);
+              log("error", "markdown_convert_failed", { ...errorFields(err), mime: sourceMime });
               // Only a refusal is about the file; anything else would send the user
               // off re-uploading a document that was never the problem.
               if (!isConversionRefusal(err)) throw err;
