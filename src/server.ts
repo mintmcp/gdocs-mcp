@@ -5,20 +5,28 @@ import { grantedScopes, isToolGranted } from "./scopes.js";
 const SERVER_NAME = "Google Docs";
 const SERVER_VERSION = "0.1.0";
 
-export function createServer(granted = grantedScopes()): McpServer {
+// Built once: createServer runs per request, and rebuilding every Zod shape
+// each time would put that cost on every call
+const TOOLS = Object.entries(GoogleDocsTools.getTools()) as Array<[string, any]>;
+
+// Resolved at import so a bad PROFILE fails the boot instead of every request
+const GRANTED = grantedScopes();
+
+const registered = TOOLS.filter(([, t]) => isToolGranted(t.handler?.scope, GRANTED)).map(([name]) => name);
+const withheld = TOOLS.map(([name]) => name).filter((name) => !registered.includes(name));
+console.log(
+  `[gdocs-hosted] scopes=${GRANTED === null ? "unrestricted" : [...GRANTED].join(",")}`,
+);
+console.log(`[gdocs-hosted] tools=${registered.join(",") || "(none)"}`);
+if (withheld.length > 0) {
+  console.log(`[gdocs-hosted] withheld (scope not granted)=${withheld.join(",")}`);
+}
+
+export function createServer(granted: Set<string> | null = GRANTED): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
-  const tools = GoogleDocsTools.getTools();
-  const registered: string[] = [];
-  const skipped: string[] = [];
-
-  for (const [toolName, toolConfig] of Object.entries(tools)) {
-    const t = toolConfig as any;
-
-    if (!isToolGranted(t.handler?.scope, granted)) {
-      skipped.push(toolName);
-      continue;
-    }
+  for (const [toolName, t] of TOOLS) {
+    if (!isToolGranted(t.handler?.scope, granted)) continue;
 
     server.registerTool(
       toolName,
@@ -33,15 +41,6 @@ export function createServer(granted = grantedScopes()): McpServer {
       },
       async (args: Record<string, unknown>) => t.handler(args),
     );
-    registered.push(toolName);
-  }
-
-  console.log(
-    `[gdocs-hosted] scopes=${granted === null ? "unrestricted" : [...granted].join(",")}`,
-  );
-  console.log(`[gdocs-hosted] tools=${registered.join(",") || "(none)"}`);
-  if (skipped.length > 0) {
-    console.log(`[gdocs-hosted] withheld (scope not granted)=${skipped.join(",")}`);
   }
 
   return server;

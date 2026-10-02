@@ -241,10 +241,10 @@ export function parseDocumentStructure(
  * Centralised so all "insert + optionally reset formatting" tools agree on the
  * exact set of fields cleared.
  */
-export function clearInheritedFormattingRequest(startIndex: number, endIndex: number): any {
+export function clearInheritedFormattingRequest(startIndex: number, endIndex: number, tabId?: string): any {
   return {
     updateTextStyle: {
-      range: { startIndex, endIndex },
+      range: { startIndex, endIndex, ...(tabId ? { tabId } : {}) },
       textStyle: {},
       fields: 'bold,italic,underline,strikethrough,link',
     },
@@ -270,6 +270,7 @@ export function clearInheritedFormattingRequest(startIndex: number, endIndex: nu
 export function buildTableInsertRequests(
   tableData: string[][],
   tableInsertIndex: number,
+  tabId?: string,
 ): any[] {
   const requests: any[] = [];
   const numRows = tableData.length;
@@ -286,7 +287,7 @@ export function buildTableInsertRequests(
         requests.push({
           insertText: {
             text,
-            location: { index: insertIndex },
+            location: { index: insertIndex, ...(tabId ? { tabId } : {}) },
           },
         });
       }
@@ -309,6 +310,19 @@ export function buildTableInsertRequests(
 export function escapeDriveQueryName(name: string | undefined): string | undefined {
   if (!name) return undefined;
   return name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+export function isGoogleServedUrl(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.protocol !== 'https:') return false;
+  const host = parsed.hostname;
+  return host === 'googleusercontent.com' || host.endsWith('.googleusercontent.com') ||
+    host === 'googleapis.com' || host.endsWith('.googleapis.com');
 }
 
 /**
