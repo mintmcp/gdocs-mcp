@@ -213,18 +213,13 @@ export function fetchLabelsMeta(fileId: string, accessToken: string): Promise<Re
 
 export function attachLabelsMeta<TArgs>(
   getFileId: (args: TArgs) => string,
-  inner: (args: TArgs, context: any) => Promise<any>,
+  inner: (args: TArgs, context: { accessToken: string }) => Promise<any>,
 ) {
   return async (args: TArgs, context: { accessToken: string }) => {
-    const raw = fetchLabelsMeta(getFileId(args), context.accessToken);
-    // catch attaches synchronously: a rejection during the inner await would
-    // otherwise be an unhandled rejection, and a label failure must degrade,
-    // never discard a successful read
-    const labelsMeta = raw === null
-      ? null
-      : raw.catch(() => ({ applied: [], labelsError: 'label read failed' }));
-    const result = await inner(args, { ...context, labelsMeta });
-    if (!labelsMeta) return result;
-    return { ...result, _meta: await labelsMeta };
+    // started before the read so both run concurrently; fetchLabelsMeta never
+    // rejects, so a label failure can't become an unhandled rejection
+    const labelsMeta = fetchLabelsMeta(getFileId(args), context.accessToken);
+    const result = await inner(args, context);
+    return labelsMeta ? { ...result, _meta: await labelsMeta } : result;
   };
 }

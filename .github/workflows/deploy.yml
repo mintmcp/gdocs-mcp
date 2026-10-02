@@ -55,11 +55,17 @@ jobs:
 
       # PROFILE selects the scope set from src/scopes.ts; an unknown name
       # crashes at boot and fails the deploy
-      - run: |
+      - env:
+          PROFILE: ${{ matrix.profile }}
+        run: |
+          if grep -q '^\[env\]' fly.toml; then
+            echo "error: fly.toml already has an [env] table, merge PROFILE into it" >&2
+            exit 2
+          fi
           {
             echo ""
             echo "[env]"
-            echo "  PROFILE = \"$(jq -r '.profile' <<<'${{ toJson(matrix) }}')\""
+            echo "  PROFILE = \"$PROFILE\""
           } >> fly.toml
 
       - run: |
