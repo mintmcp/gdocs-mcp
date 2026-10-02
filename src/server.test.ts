@@ -195,4 +195,27 @@ describe("Word-upload refusal on a write tool", () => {
     expect(JSON.parse((result.content as any)[0].text).error).toContain(SECRET);
     expect(records(written)).toEqual([{ level: "warn", event: "tool_call_error", tool: "append_text" }]);
   });
+
+  it("keeps the status when the Drive lookup itself fails", async () => {
+    const body = { error: { code: 404, status: "NOT_FOUND", message: `File not found: ${SECRET}.` } };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify(body), { status: 404, headers: { "content-type": "application/json" } })),
+    );
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await createServer(null).connect(serverTransport);
+    await client.connect(clientTransport);
+    const written = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    const result = await requestContext.run({ accessToken: "tok" } as any, () =>
+      client.callTool({ name: "append_text", arguments: { document_id: "w1", text: "x" } }),
+    );
+
+    expect(result.isError).toBe(true);
+    const logged = records(written);
+    expect(logged).toHaveLength(1);
+    expect(logged[0]).toMatchObject({ level: "warn", event: "tool_call_error", tool: "append_text", status: 404 });
+    expect(JSON.stringify(logged)).not.toContain(SECRET);
+  });
 });
