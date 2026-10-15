@@ -14,6 +14,9 @@ import {
   validateIndexRange,
   validateInsertIndex,
   isGoogleServedUrl,
+  listStyleRequest,
+  buildTextStyle,
+  clearInheritedParagraphStyleRequests,
 } from './docs-structure.js';
 
 /**
@@ -169,7 +172,7 @@ describe('clearInheritedFormattingRequest', () => {
       updateTextStyle: {
         range: { startIndex: 5, endIndex: 10 },
         textStyle: {},
-        fields: 'bold,italic,underline,strikethrough,link',
+        fields: 'bold,italic,underline,strikethrough,fontSize,foregroundColor,link',
       },
     });
   });
@@ -411,5 +414,68 @@ describe('isGoogleServedUrl', () => {
     expect(isGoogleServedUrl('https://googleusercontent.com.evil.example/x')).toBe(false);
     expect(isGoogleServedUrl('http://lh7-us.googleusercontent.com/x')).toBe(false);
     expect(isGoogleServedUrl('not a url')).toBe(false);
+  });
+});
+
+describe('clearInheritedParagraphStyleRequests', () => {
+  it('resets the named style and removes bullets over the range', () => {
+    expect(clearInheritedParagraphStyleRequests(8, 19, 't.1')).toEqual([
+      { updateParagraphStyle: { range: { startIndex: 8, endIndex: 19, tabId: 't.1' }, paragraphStyle: { namedStyleType: 'NORMAL_TEXT' }, fields: 'namedStyleType' } },
+      { deleteParagraphBullets: { range: { startIndex: 8, endIndex: 19, tabId: 't.1' } } },
+    ]);
+  });
+});
+
+describe('listStyleRequest', () => {
+  it('creates bullets with the preset for each list style', () => {
+    expect(listStyleRequest(5, 20, 'bullet')).toEqual({
+      createParagraphBullets: { range: { startIndex: 5, endIndex: 20 }, bulletPreset: 'BULLET_DISC_CIRCLE_SQUARE' },
+    });
+    expect(listStyleRequest(5, 20, 'numbered').createParagraphBullets.bulletPreset).toBe('NUMBERED_DECIMAL_ALPHA_ROMAN');
+    expect(listStyleRequest(5, 20, 'checkbox').createParagraphBullets.bulletPreset).toBe('BULLET_CHECKBOX');
+  });
+
+  it('removes bullets for none and carries the tab id', () => {
+    expect(listStyleRequest(5, 20, 'none', 't.1')).toEqual({
+      deleteParagraphBullets: { range: { startIndex: 5, endIndex: 20, tabId: 't.1' } },
+    });
+  });
+});
+
+describe('buildTextStyle', () => {
+  it('maps every supported property to a field', () => {
+    expect(buildTextStyle({ bold: true, italic: false, font_size: 14, color: '#FF0000', link_url: 'https://x.y' })).toEqual({
+      textStyle: {
+        bold: true,
+        italic: false,
+        fontSize: { magnitude: 14, unit: 'PT' },
+        foregroundColor: { color: { rgbColor: { red: 1, green: 0, blue: 0 } } },
+        link: { url: 'https://x.y' },
+      },
+      fields: ['bold', 'italic', 'fontSize', 'foregroundColor', 'link'],
+    });
+  });
+
+  it('clears a link with an empty url and rejects a bad colour', () => {
+    expect(buildTextStyle({ link_url: '' })).toEqual({ textStyle: { link: null }, fields: ['link'] });
+    expect(() => buildTextStyle({ color: 'red' })).toThrow(/6-digit hex/);
+  });
+
+  it('rejects an empty request', () => {
+    expect(() => buildTextStyle({})).toThrow(/At least one/);
+  });
+});
+
+describe('parseDocumentStructure list items', () => {
+  it('reports the bullet nesting level on list paragraphs only', () => {
+    const content = [
+      paragraph('plain\n'),
+      { ...paragraph('item\n', { startIndex: 7 }), paragraph: { ...paragraph('item\n').paragraph, bullet: { listId: 'kix.1' } } },
+      { ...paragraph('nested\n', { startIndex: 12 }), paragraph: { ...paragraph('nested\n').paragraph, bullet: { listId: 'kix.1', nestingLevel: 1 } } },
+    ];
+    const { elements } = parseDocumentStructure(content);
+    expect(elements[0].bullet).toBeUndefined();
+    expect(elements[1].bullet).toEqual({ nestingLevel: 0 });
+    expect(elements[2].bullet).toEqual({ nestingLevel: 1 });
   });
 });

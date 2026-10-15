@@ -5,6 +5,7 @@ import {
   docLocation,
   docRange,
   endOfBodyIndex,
+  appendInsertion,
   renderStructureText,
   resolveTab,
   tabsCriteriaFor,
@@ -185,5 +186,27 @@ describe('tabsCriteriaFor', () => {
 
   it('lists the available tabs for an unknown tab_id', () => {
     expect(() => tabsCriteriaFor(tabs, 't.nope')).toThrow(/t\.0 \(One\).*t\.1 \(Two\)/);
+  });
+});
+
+describe('appendInsertion', () => {
+  it('starts a new paragraph when the last one has text', () => {
+    const body = [para('alpha\n', 1, 7)];
+    expect(appendInsertion(body, 'beta')).toEqual({ index: 6, text: '\nbeta', paragraphStart: 7 });
+  });
+
+  it('does not add a separator when the last paragraph is empty or the text brings its own', () => {
+    expect(appendInsertion([para('alpha\n', 1, 7), para('\n', 7, 8)], 'beta')).toEqual({ index: 7, text: 'beta', paragraphStart: 7 });
+    expect(appendInsertion([para('alpha\n', 1, 7)], '\nbeta')).toEqual({ index: 6, text: '\nbeta', paragraphStart: 6 });
+  });
+
+  it('writes into a table-terminated body without a separator', () => {
+    const body = [{ startIndex: 1, endIndex: 10, table: {} }, para('\n', 10, 11)];
+    expect(appendInsertion(body, 'beta')).toEqual({ index: 10, text: 'beta', paragraphStart: 10 });
+  });
+
+  it('treats an image-only paragraph as content', () => {
+    const body = [{ startIndex: 1, endIndex: 3, paragraph: { elements: [{ inlineObjectElement: { inlineObjectId: 'kix.img' } }, { textRun: { content: '\n' } }] } }];
+    expect(appendInsertion(body, 'caption')).toEqual({ index: 2, text: '\ncaption', paragraphStart: 3 });
   });
 });

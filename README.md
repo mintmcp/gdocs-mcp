@@ -63,10 +63,10 @@ and no `_meta` is returned; absence means "surfacing not enabled", never
 ## Tool surface (14 tools)
 
 - **Discovery** — `search_documents`
-- **Read** — `get_document` (optional `include_structure`, `include_comments`, per-tab reads via `tab_id`), `get_document_images`
+- **Read** — `get_document` (plain text, or markdown via `format: "markdown"`; optional `include_structure`, `include_comments`, per-tab reads via `tab_id`), `get_document_images`
 - **Create** — `create_document` (optional initial body, optional parent folder)
-- **Insert / append text** — `insert_text` (index-based), `append_text` (end-of-doc), `append_table` (with reverse-order cell insertion)
-- **Update text** — `replace_text`, `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/link), `update_paragraph_style` (heading level, alignment)
+- **Insert / append text** — `insert_text` (index-based), `append_text` (end-of-doc, as a new paragraph), `append_table` (with reverse-order cell insertion)
+- **Update text** — `replace_text`, `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/font size/colour/link), `update_paragraph_style` (heading level, alignment, bullet/numbered/checkbox lists)
 
 Round 2 added the multi-tab summary: `get_document` now returns a `tabs`
 array when the doc uses Google Docs Tabs, plus a `headings` list and the

@@ -8,10 +8,13 @@ import {
   buildTableInsertRequests,
   buildWriteControl,
   clearInheritedFormattingRequest,
+  clearInheritedParagraphStyleRequests,
   escapeDriveQueryName,
   extractHeadings,
   findLetterByContent,
   isGoogleServedUrl,
+  listStyleRequest,
+  buildTextStyle,
   parseDocumentStructure,
   parseExportArtifacts,
   summarizeTabs,
@@ -58,6 +61,7 @@ import {
   MAX_TEXT_CHARS as MAX_WORD_TEXT_CHARS,
 } from "./lib/wordText.js";
 import {
+  appendInsertion,
   collectInlineObjects,
   docLocation,
   docRange,
@@ -324,6 +328,7 @@ const structureElementSchema = z.object({
   text: z.string().optional(),
   inlineObjectId: z.string().optional(),
   headingLevel: z.number().int().min(1).max(6).optional(),
+  bullet: z.object({ nestingLevel: z.number().int() }).optional().describe('Paragraph only: present when the paragraph is a list item, with its nesting level (0 = top level).'),
   rows: z.number().optional().describe('Table only: number of rows'),
   columns: z.number().optional().describe('Table only: number of columns'),
   cells: z.array(z.array(z.string())).optional().describe('Table only: cell text by row then column. Long cells are truncated and a cell holding a nested table reads as empty. Omitted for later tables once a document exhausts the structure budget, which counts both cell characters and cell count; `message` says when that happened. When has_merged_cells is true, a position covered by a merge reads as an empty string, so positions still line up with columns, but an empty cell may be a covered position rather than a genuinely empty one.'),
@@ -642,7 +647,7 @@ export class GoogleDocsTools {
       },
 
       get_document: {
-        description: 'Read the contents of a Google Doc as plain text. Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need; pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable; comment threads are document-level, so ones anchored in other tabs are still returned but without `anchor_offset`. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
+        description: 'Read the contents of a Google Doc as plain text, or as markdown with format="markdown" (headings, bold, links, lists and tables preserved; best for understanding a formatted document). Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need; pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable; comment threads are document-level, so ones anchored in other tabs are still returned but without `anchor_offset`. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
         readOnlyHint: true,
         outputSchema: {
           id: z.string(),
@@ -651,6 +656,7 @@ export class GoogleDocsTools {
           webViewLink: z.string().optional(),
           revisionId: z.string().optional(),
           mimeType: z.string().optional().describe('Present for non-native files such as .docx uploads'),
+          format: z.literal('markdown').optional().describe('Present when content is markdown rather than plain text'),
           truncated: z.boolean().optional().describe('True when content was cut at the character cap'),
           message: z.string().optional().describe('Why content is partial, or which options do not apply'),
           structure: z.array(structureElementSchema).optional(),
@@ -665,13 +671,22 @@ export class GoogleDocsTools {
         schema: {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
           tab_id: z.string().optional().describe('Read a single tab of a multi-tab document: tabProperties.tabId, the value after ?tab= in the document URL (e.g. "t.abc123"), also listed in this tool\'s `tabs` output. With tab_id, `content`, `structure` and `headings` all describe that tab and their indices are valid for the editing tools when passed the same tab_id. Without it, `content` concatenates all tabs while structure indices cover only the first tab.'),
+          format: z.enum(['text', 'markdown']).optional().describe('"text" (default) returns plain text. "markdown" renders headings, bold, italic, links, lists and tables as markdown; it reads the whole document, so it cannot be combined with tab_id, and comment anchors are plain-text offsets, so it cannot be combined with include_comments.'),
           include_structure: z.boolean().optional().describe('Include document structure with startIndex/endIndex for each element. Required before using index-based tools.'),
           include_table_styles: z.boolean().optional().describe('Also report each table\'s cell styles, as a `styles` legend plus a `cell_styles` index grid. Requires include_structure=true. Use it to see how a table is currently formatted before matching or replicating it.'),
           include_comments: z.boolean().optional().describe('Include comment thread metadata (author email/name, timestamp, replies, resolved status, emoji reactions). `content` is returned verbatim — no inline markers are inserted. Each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchor deleted by later edits) omit `anchor_offset`.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", attachLabelsMeta((a: any) => a.document_id, async ({ document_id, tab_id, include_structure, include_comments, include_table_styles }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/drive.readonly", attachLabelsMeta((a: any) => a.document_id, async ({ document_id, tab_id, format, include_structure, include_comments, include_table_styles }: any, context: any) => {
           try {
             const { accessToken } = context;
+            const asMarkdown = format === 'markdown';
+            const markdownConflicts = [
+              ...(tab_id ? ['tab_id (markdown is exported for the whole document)'] : []),
+              ...(include_comments ? ['include_comments (comment anchors are plain-text offsets)'] : []),
+            ];
+            if (asMarkdown && markdownConflicts.length > 0) {
+              throw new Error(`format "markdown" cannot be combined with ${markdownConflicts.join(' or ')}. Drop format or the other option.`);
+            }
 
             // Get file metadata for title and link
             const metadata = await makeDriveRequest(
@@ -707,10 +722,10 @@ export class GoogleDocsTools {
                   `The text was truncated at ${MAX_WORD_TEXT_CHARS} characters. Full file: ${webViewLink}`
                 );
               }
-              if (include_structure || include_comments || tab_id) {
+              if (include_structure || include_comments || tab_id || asMarkdown) {
                 wordNotes.push(
                   `'${metadata.name}' is a Word upload, not a Google Doc, ` +
-                  `so document structure, tabs and comments are unavailable for it.`
+                  `so document structure, tabs, comments and markdown are unavailable for it.`
                 );
               }
               if (wordNotes.length) wordOutput.message = wordNotes.join(' ');
@@ -750,7 +765,8 @@ export class GoogleDocsTools {
             } else {
               // Accept-Language pins the export footer to the English template
               // the comment-reaction parser expects
-              const exportUrl = `${GOOGLE_DRIVE_API}/files/${encodeURIComponent(document_id)}/export?mimeType=text/plain`;
+              const exportMime = encodeURIComponent(asMarkdown ? 'text/markdown' : 'text/plain');
+              const exportUrl = `${GOOGLE_DRIVE_API}/files/${encodeURIComponent(document_id)}/export?mimeType=${exportMime}`;
               const response = await fetch(exportUrl, {
                 headers: {
                   'Authorization': `Bearer ${accessToken}`,
@@ -784,6 +800,7 @@ export class GoogleDocsTools {
             }
 
             output.content = content;
+            if (asMarkdown) output.format = 'markdown';
 
             const tabs = summarizeTabs(doc?.tabs);
             if (tabs.length > 0) output.tabs = tabs;
@@ -946,16 +963,16 @@ export class GoogleDocsTools {
       },
 
       append_text: {
-        description: 'Append plain text to the end of a Google Doc (or, with tab_id, to the end of that tab). Use get_document first to verify the document exists and see current content. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
+        description: 'Append plain text to the end of a Google Doc (or, with tab_id, to the end of that tab) as a new paragraph: a newline is added before the text unless the document already ends with an empty paragraph or the text starts with one. Use get_document first to verify the document exists and see current content. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
         },
         schema: {
           document_id: z.string().describe('Google Doc ID'),
-          text: z.string().describe('Plain text to append to the end of the document'),
+          text: z.string().min(1).describe('Plain text to append to the end of the document'),
           tab_id: z.string().optional().describe(TAB_ID_DESCRIPTION),
-          clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from preceding text on the newly appended content. Defaults to true.'),
+          clear_inherited_formatting: z.boolean().optional().describe('Clear formatting inherited from the preceding text (character styles, and heading or list paragraph styles) on the newly appended content. Defaults to true.'),
           required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", docsOnly(async ({ document_id, text, tab_id, clear_inherited_formatting, required_revision_id }: any, context: any) => {
@@ -963,18 +980,22 @@ export class GoogleDocsTools {
             const { accessToken } = context;
 
             const { resolved } = await fetchResolvedTab(document_id, accessToken, tab_id);
-            const endIndex = endOfBodyIndex(resolved.body);
+            const insertion = appendInsertion(resolved.body, text);
 
-            // Insert text at the end, optionally clearing inherited formatting
             const requests: any[] = [{
               insertText: {
-                location: docLocation(endIndex, resolved.tabId),
-                text,
+                location: docLocation(insertion.index, resolved.tabId),
+                text: insertion.text,
               },
             }];
 
             if (clear_inherited_formatting !== false) {
-              requests.push(clearInheritedFormattingRequest(endIndex, endIndex + text.length, resolved.tabId));
+              const end = insertion.index + insertion.text.length;
+              // The separator newline still belongs to the previous paragraph, whose style must stay
+              requests.push(
+                clearInheritedFormattingRequest(insertion.index, end, resolved.tabId),
+                ...clearInheritedParagraphStyleRequests(insertion.paragraphStart, end, resolved.tabId),
+              );
             }
 
             const writeControl = buildWriteControl(required_revision_id);
@@ -1166,7 +1187,7 @@ export class GoogleDocsTools {
       },
 
       update_text_style: {
-        description: 'Apply formatting (bold, italic, underline, strikethrough, link) to a text range in a Google Doc. Use get_document with include_structure=true to find the correct indices. NOTE: If you also need to set a heading level via update_paragraph_style, do that first — heading changes reset character formatting. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
+        description: 'Apply formatting (bold, italic, underline, strikethrough, font size, colour, link) to a text range in a Google Doc. Use get_document with include_structure=true to find the correct indices. NOTE: If you also need to set a heading level via update_paragraph_style, do that first — heading changes reset character formatting. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
@@ -1180,48 +1201,17 @@ export class GoogleDocsTools {
           italic: z.boolean().optional().describe('Set italic'),
           underline: z.boolean().optional().describe('Set underline'),
           strikethrough: z.boolean().optional().describe('Set strikethrough'),
-          link_url: z.string().optional().describe('Set hyperlink URL'),
+          font_size: z.coerce.number().positive().max(400).optional().describe('Font size in points, e.g. 14'),
+          color: z.string().optional().describe('Text colour as 6-digit hex, e.g. #1A73E8'),
+          link_url: z.string().optional().describe('Set hyperlink URL (empty string removes the link)'),
           required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", docsOnly(async ({ document_id, startIndex, endIndex, tab_id, bold, italic, underline, strikethrough, link_url, required_revision_id }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", docsOnly(async ({ document_id, startIndex, endIndex, tab_id, bold, italic, underline, strikethrough, font_size, color, link_url, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
             validateIndexRange(startIndex, endIndex);
-
-            // Build textStyle and fields dynamically from provided params
-            const textStyle: any = {};
-            const fields: string[] = [];
-
-            if (bold !== undefined) {
-              textStyle.bold = bold;
-              fields.push('bold');
-            }
-            if (italic !== undefined) {
-              textStyle.italic = italic;
-              fields.push('italic');
-            }
-            if (underline !== undefined) {
-              textStyle.underline = underline;
-              fields.push('underline');
-            }
-            if (strikethrough !== undefined) {
-              textStyle.strikethrough = strikethrough;
-              fields.push('strikethrough');
-            }
-            if (link_url !== undefined) {
-              // Empty string => remove the link, otherwise set it.
-              if (link_url === '') {
-                textStyle.link = null;
-              } else {
-                textStyle.link = { url: link_url };
-              }
-              fields.push('link');
-            }
-
-            if (fields.length === 0) {
-              throw new Error('At least one style property must be provided (bold, italic, underline, strikethrough, link_url)');
-            }
+            const { textStyle, fields } = buildTextStyle({ bold, italic, underline, strikethrough, font_size, color, link_url });
 
             const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
@@ -1253,7 +1243,7 @@ export class GoogleDocsTools {
       },
 
       update_paragraph_style: {
-        description: 'Apply paragraph formatting (heading level, alignment) to a range in a Google Doc. Use get_document with include_structure=true to find the correct indices. WARNING: Setting heading_level applies a named style that resets character-level formatting (bold, italic, etc.). If you also need to apply text styles, call update_paragraph_style first, then apply text styles after. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
+        description: 'Apply paragraph formatting (heading level, alignment, list style) to a range in a Google Doc. list_style turns every paragraph in the range into bullet, numbered or checkbox list items, or removes bullets with "none"; nesting follows the paragraphs\' existing indentation. Use get_document with include_structure=true to find the correct indices. WARNING: Setting heading_level applies a named style that resets character-level formatting (bold, italic, etc.). If you also need to apply text styles, call update_paragraph_style first, then apply text styles after. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
@@ -1265,9 +1255,10 @@ export class GoogleDocsTools {
           tab_id: z.string().optional().describe(TAB_ID_DESCRIPTION),
           heading_level: z.coerce.number().int().min(0).max(6).optional().describe('Heading level: 0=normal text, 1-6=heading levels'),
           alignment: z.enum(['START', 'CENTER', 'END', 'JUSTIFIED']).optional().describe('Paragraph alignment'),
+          list_style: z.enum(['bullet', 'numbered', 'checkbox', 'none']).optional().describe('Make the paragraphs in the range list items: "bullet" (disc), "numbered" (1. 2. 3.), "checkbox", or "none" to remove existing bullets'),
           required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
-        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", docsOnly(async ({ document_id, startIndex, endIndex, tab_id, heading_level, alignment, required_revision_id }: any, context: any) => {
+        handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", docsOnly(async ({ document_id, startIndex, endIndex, tab_id, heading_level, alignment, list_style, required_revision_id }: any, context: any) => {
           try {
             const { accessToken } = context;
 
@@ -1299,28 +1290,34 @@ export class GoogleDocsTools {
               fields.push('alignment');
             }
 
-            if (fields.length === 0) {
-              throw new Error('At least one style property must be provided (heading_level, alignment)');
+            if (fields.length === 0 && !list_style) {
+              throw new Error('At least one style property must be provided (heading_level, alignment, list_style)');
             }
+
+            const requests: any[] = [];
+            if (fields.length > 0) {
+              requests.push({
+                updateParagraphStyle: {
+                  range: docRange(startIndex, endIndex, tab_id),
+                  paragraphStyle,
+                  fields: fields.join(','),
+                },
+              });
+            }
+            if (list_style) {
+              requests.push(listStyleRequest(startIndex, endIndex, list_style, tab_id));
+            }
+            const applied = [...fields, ...(list_style ? [`list_style=${list_style}`] : [])];
 
             const writeControl = buildWriteControl(required_revision_id);
             await makeDocsRequest(`/${encodeURIComponent(document_id)}:batchUpdate`, accessToken, {
               method: 'POST',
-              body: JSON.stringify({
-                requests: [{
-                  updateParagraphStyle: {
-                    range: docRange(startIndex, endIndex, tab_id),
-                    paragraphStyle,
-                    fields: fields.join(','),
-                  },
-                }],
-                ...(writeControl ? { writeControl } : {}),
-              }),
+              body: JSON.stringify({ requests, ...(writeControl ? { writeControl } : {}) }),
             });
 
             const output = {
               id: document_id,
-              message: `Applied paragraph style (${fields.join(', ')}) to range ${startIndex}-${endIndex}`,
+              message: `Applied paragraph style (${applied.join(', ')}) to range ${startIndex}-${endIndex}`,
             };
             return {
               content: [{ type: 'text', text: JSON.stringify(output, null, 2) }],

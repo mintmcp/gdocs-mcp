@@ -100,6 +100,19 @@ export function endOfBodyIndex(body: any[]): number {
 }
 
 /**
+ * Google inserts end-of-body text before the final newline, so without a
+ * separator it joins the last paragraph. Callers who pass their own leading
+ * newline keep control of the spacing
+ */
+export function appendInsertion(body: any[], text: string): { index: number; text: string; paragraphStart: number } {
+  const index = endOfBodyIndex(body);
+  const elements: any[] = body[body.length - 1]?.paragraph?.elements ?? [];
+  const lastHasContent = elements.some((el) => el.textRun ? el.textRun.content.replace(/\n$/, '') !== '' : true);
+  const separate = lastHasContent && !text.startsWith('\n');
+  return { index, text: separate ? `\n${text}` : text, paragraphStart: separate ? index + 1 : index };
+}
+
+/**
  * Per-tab text is rendered from the same parsed structure the editing indices
  * come from, because the Drive plain-text export cannot be scoped to a tab
  */

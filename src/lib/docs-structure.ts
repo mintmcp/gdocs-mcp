@@ -10,6 +10,7 @@
 
 import {
   describeTable,
+  hexToRgbColor,
   newStructureBudget,
   type ReportedCellStyle,
 } from './tableModel.js';
@@ -57,6 +58,7 @@ export interface StructureElement {
   text?: string;
   inlineObjectId?: string;
   headingLevel?: number;
+  bullet?: { nestingLevel: number };
   rows?: number;
   columns?: number;
   cells?: string[][];
@@ -192,12 +194,14 @@ export function parseDocumentStructure(
         ?.map((el: any) => el.textRun?.content || '')
         .join('') || '';
       const headingLevel = namedStyleToHeadingLevel(element.paragraph.paragraphStyle?.namedStyleType);
+      const bullet = element.paragraph.bullet;
       elements.push({
         type: 'paragraph',
         startIndex: element.startIndex ?? 0,
         endIndex: element.endIndex,
         text,
         ...(headingLevel !== undefined ? { headingLevel } : {}),
+        ...(bullet ? { bullet: { nestingLevel: bullet.nestingLevel ?? 0 } } : {}),
       });
 
       // Extract inline images from paragraph elements
@@ -246,9 +250,77 @@ export function clearInheritedFormattingRequest(startIndex: number, endIndex: nu
     updateTextStyle: {
       range: { startIndex, endIndex, ...(tabId ? { tabId } : {}) },
       textStyle: {},
-      fields: 'bold,italic,underline,strikethrough,link',
+      fields: 'bold,italic,underline,strikethrough,fontSize,foregroundColor,link',
     },
   };
+}
+
+export type ListStyle = 'bullet' | 'numbered' | 'checkbox' | 'none';
+
+const LIST_PRESETS: Record<Exclude<ListStyle, 'none'>, string> = {
+  bullet: 'BULLET_DISC_CIRCLE_SQUARE',
+  numbered: 'NUMBERED_DECIMAL_ALPHA_ROMAN',
+  checkbox: 'BULLET_CHECKBOX',
+};
+
+/**
+ * Bullets are their own request type, not a paragraph style field, so they
+ * ride alongside updateParagraphStyle in the same batch
+ */
+export function listStyleRequest(startIndex: number, endIndex: number, listStyle: ListStyle, tabId?: string): any {
+  const range = { startIndex, endIndex, ...(tabId ? { tabId } : {}) };
+  if (listStyle === 'none') return { deleteParagraphBullets: { range } };
+  return { createParagraphBullets: { range, bulletPreset: LIST_PRESETS[listStyle] } };
+}
+
+export interface TextStyleArgs {
+  bold?: boolean;
+  italic?: boolean;
+  underline?: boolean;
+  strikethrough?: boolean;
+  font_size?: number;
+  color?: string;
+  link_url?: string;
+}
+
+/** The updateTextStyle payload for update_text_style, with its field mask in argument order */
+export function buildTextStyle(args: TextStyleArgs): { textStyle: Record<string, unknown>; fields: string[] } {
+  const textStyle: Record<string, unknown> = {};
+  const fields: string[] = [];
+  for (const key of ['bold', 'italic', 'underline', 'strikethrough'] as const) {
+    if (args[key] !== undefined) {
+      textStyle[key] = args[key];
+      fields.push(key);
+    }
+  }
+  if (args.font_size !== undefined) {
+    textStyle.fontSize = { magnitude: args.font_size, unit: 'PT' };
+    fields.push('fontSize');
+  }
+  if (args.color !== undefined) {
+    textStyle.foregroundColor = { color: hexToRgbColor(args.color, 'color') };
+    fields.push('foregroundColor');
+  }
+  if (args.link_url !== undefined) {
+    textStyle.link = args.link_url === '' ? null : { url: args.link_url };
+    fields.push('link');
+  }
+  if (fields.length === 0) {
+    throw new Error('At least one style property must be provided (bold, italic, underline, strikethrough, font_size, color, link_url)');
+  }
+  return { textStyle, fields };
+}
+
+/**
+ * A paragraph split off the end of a heading or list item inherits that
+ * paragraph style; this resets it so appended text reads as body text
+ */
+export function clearInheritedParagraphStyleRequests(startIndex: number, endIndex: number, tabId?: string): any[] {
+  const range = { startIndex, endIndex, ...(tabId ? { tabId } : {}) };
+  return [
+    { updateParagraphStyle: { range, paragraphStyle: { namedStyleType: 'NORMAL_TEXT' }, fields: 'namedStyleType' } },
+    { deleteParagraphBullets: { range } },
+  ];
 }
 
 /**
