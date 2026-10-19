@@ -3,8 +3,8 @@
 A hosted MCP server that wraps the Google Docs and Drive APIs, packaged for
 the [MintMCP](https://mintmcp.com) hosted runtime. Speaks streamable HTTP on
 port 8000, reads the per-request user access token from the
-`Authorization: Bearer <token>` header, and exposes 14 tools across document
-discovery, reading, editing, commenting, and image extraction.
+`Authorization: Bearer <token>` header, and exposes 25 tools across document
+discovery, reading, editing, structure, commenting, suggestions and images.
 
 ## Auth contract
 
@@ -60,19 +60,19 @@ code instead of failing the read. Without the scope no label call is made
 and no `_meta` is returned; absence means "surfacing not enabled", never
 "no labels".
 
-## Tool surface (14 tools)
+## Tool surface (25 tools)
 
 - **Discovery** — `search_documents`
-- **Read** — `get_document` (plain text, or markdown via `format: "markdown"`; optional `include_structure`, `include_comments`, per-tab reads via `tab_id`), `get_document_images`
-- **Create** — `create_document` (optional initial body, optional parent folder)
-- **Insert / append text** — `insert_text` (index-based), `append_text` (end-of-doc, as a new paragraph), `append_table` (with reverse-order cell insertion)
-- **Update text** — `replace_text`, `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/font size/colour/link), `update_paragraph_style` (heading level, alignment, bullet/numbered/checkbox lists)
+- **Read** — `get_document` (plain text, or markdown via `format: "markdown"`; optional `include_structure`, `include_comments`, per-tab reads via `tab_id`, `suggestions_view_mode`; structure lists headers, footers and pending suggestion ids), `get_document_images`
+- **Create / document** — `create_document` (optional initial body, optional parent folder), `convert_to_google_doc`, `rename_document`, `update_document_style` (margins, page size, orientation, first-page header, page number start), `manage_tab` (add, rename, delete)
+- **Insert / append text** — `insert_text` (index-based, into the body or a header, footer or footnote via `segment_id`), `append_text` (end-of-doc, as a new paragraph), `insert_break` (page or section), `insert_footnote`, `set_header_footer`
+- **Update text** — `replace_text` (optionally by regex), `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/small caps/font size and family/colour/highlight/super- and subscript/link), `update_paragraph_style` (heading level or named style, alignment, lists with any bullet preset, line spacing, spacing, indents, keep-with-next, page break before)
+- **Tables** — `append_table`, `insert_table` (with reverse-order cell insertion), `update_table_style` (cell backgrounds, borders, alignment), `modify_table` (insert/delete rows and columns, merge/unmerge cells, column widths, pinned header rows)
+- **Images** — `insert_image` (by URL), `replace_image`
+- **Collaboration** — `add_comment` (new thread or reply), `review_suggestion` (accept, reject, delete); the content-editing tools (`append_text`, `insert_text`, `replace_text`, `delete_content`, `update_text_style`, `update_paragraph_style`, `append_table`, `insert_table`, `update_table_style`, `modify_table`, `insert_break`, `insert_image`) take `suggest: true` to land their change as a tracked suggestion
 
-Round 2 added the multi-tab summary: `get_document` now returns a `tabs`
-array when the doc uses Google Docs Tabs, plus a `headings` list and the
-current `revisionId` for optimistic-concurrency-controlled writes via
-`required_revision_id`. Round 2 also added structured `error.details`
-passthrough in `toolErrorResponse` envelopes.
+The tool modules live under `src/tools/`, one file per domain, assembled by
+`src/tools.ts`.
 
 ## Local build & run
 

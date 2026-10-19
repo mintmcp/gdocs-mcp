@@ -489,3 +489,225 @@ export function styleFailureWarning(located: boolean, status?: number): string {
 
   return `The table was created, but ${cause}${unverified}. Do not insert it again — ${recovery}.${first}`;
 }
+
+/**
+ * The table that starts exactly at `tableStartIndex`, or an error that says
+ * which indices would have worked. An index inside a table names a nested
+ * table, which the Docs API does not expose, so no lookup can reach it.
+ */
+export function locateTable(doc: DocsBody, tableStartIndex: number, tabId?: string): DocsTableElement {
+  const element = findTableStartingAt(doc, tableStartIndex);
+  if (element) return element;
+
+  const tables = (doc?.body?.content ?? []).filter((c) => c.table);
+  const enclosing = tables.find(
+    (c) => (c.startIndex ?? 0) < tableStartIndex && tableStartIndex < c.endIndex
+  );
+  if (enclosing) {
+    throw new Error(
+      `Index ${tableStartIndex} is inside the table at ${enclosing.startIndex}-${enclosing.endIndex}, ` +
+      `so it refers to a table nested in one of its cells. Nested tables cannot be changed. ` +
+      `Use the outer table at ${enclosing.startIndex} instead.`
+    );
+  }
+  const starts = tables.map((c) => c.startIndex);
+  const listed = starts.slice(0, 20).join(', ');
+  const rest = starts.length > 20 ? ` and ${starts.length - 20} more` : '';
+  throw new Error(
+    `No table starts at index ${tableStartIndex}. ` +
+    (starts.length ? `Tables here start at ${listed}${rest}.` : 'No tables were found.') +
+    (tabId ? ` Only the tab '${tabId}' was read; pass a different tab_id for tables in other tabs.` : '')
+  );
+}
+
+export interface TableShape {
+  rows: number;
+  columns: number;
+}
+
+export const tableShape = (element: DocsTableElement): TableShape => ({
+  rows: element.table?.rows ?? 0,
+  columns: element.table?.columns ?? 0,
+});
+
+export interface CellRange {
+  rowIndex: number;
+  columnIndex: number;
+  rowSpan: number;
+  columnSpan: number;
+}
+
+/**
+ * A zero-based cell range checked against the table's shape. Spans default to
+ * the rest of the table. The start is checked before the default span is
+ * derived from it, or the span would go negative and the range read backwards.
+ */
+export function validateCellRange(
+  shape: TableShape,
+  tableStartIndex: number,
+  args: { row_index?: number; column_index?: number; row_span?: number; column_span?: number },
+): CellRange {
+  const { rows, columns } = shape;
+  const rowIndex = args.row_index ?? 0;
+  const columnIndex = args.column_index ?? 0;
+  const size = `The table at index ${tableStartIndex} has ${rows} rows and ${columns} columns`;
+
+  if (rowIndex >= rows || columnIndex >= columns) {
+    throw new Error(
+      `${size}, so row_index ${rowIndex} and column_index ${columnIndex} are out of range. ` +
+      `Both are zero-based, so the last cell is row ${rows - 1}, column ${columns - 1}.`
+    );
+  }
+
+  const rowSpan = args.row_span ?? rows - rowIndex;
+  const columnSpan = args.column_span ?? columns - columnIndex;
+
+  if (rowIndex + rowSpan > rows || columnIndex + columnSpan > columns) {
+    throw new Error(
+      `The requested range (rows ${rowIndex}-${rowIndex + rowSpan - 1}, columns ${columnIndex}-${columnIndex + columnSpan - 1}) ` +
+      `does not fit. ${size}.`
+    );
+  }
+
+  return { rowIndex, columnIndex, rowSpan, columnSpan };
+}
+
+export const TABLE_ACTIONS = [
+  'insert_row', 'insert_column', 'delete_row', 'delete_column',
+  'merge_cells', 'unmerge_cells', 'set_column_width', 'pin_header_rows',
+] as const;
+export type TableAction = typeof TABLE_ACTIONS[number];
+
+export const MIN_COLUMN_WIDTH_PT = 5;
+export const MAX_COLUMN_WIDTH_PT = 2000;
+
+export interface TableModificationArgs {
+  action: TableAction;
+  row_index?: number;
+  column_index?: number;
+  row_span?: number;
+  column_span?: number;
+  position?: 'before' | 'after';
+  width_pt?: number;
+  pinned_rows?: number;
+}
+
+export interface TableModification {
+  request: any;
+  shape: TableShape;
+  message: string;
+}
+
+/**
+ * One Docs request for a structural change to a table whose shape is known,
+ * with the shape it leaves behind. Everything is validated here so the tool
+ * never sends Google a request it would reject with a bare 400.
+ */
+export function buildTableModification(
+  shape: TableShape,
+  tableStartLocation: { index: number; tabId?: string },
+  args: TableModificationArgs,
+): TableModification {
+  const { action } = args;
+  const tableStartIndex = tableStartLocation.index;
+  const cellLocation = (range: CellRange) => ({
+    tableStartLocation,
+    rowIndex: range.rowIndex,
+    columnIndex: range.columnIndex,
+  });
+  const after = args.position !== 'before';
+
+  switch (action) {
+    case 'insert_row': {
+      const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
+      return {
+        request: { insertTableRow: { tableCellLocation: cellLocation(cell), insertBelow: after } },
+        shape: { rows: shape.rows + 1, columns: shape.columns },
+        message: `Inserted a row ${after ? 'below' : 'above'} row ${cell.rowIndex}`,
+      };
+    }
+    case 'insert_column': {
+      const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
+      return {
+        request: { insertTableColumn: { tableCellLocation: cellLocation(cell), insertRight: after } },
+        shape: { rows: shape.rows, columns: shape.columns + 1 },
+        message: `Inserted a column ${after ? 'right of' : 'left of'} column ${cell.columnIndex}`,
+      };
+    }
+    case 'delete_row': {
+      if (shape.rows <= 1) {
+        throw new Error('This table has a single row; deleting the last row deletes the table. Use delete_content over the table\'s range for that.');
+      }
+      const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
+      return {
+        request: { deleteTableRow: { tableCellLocation: cellLocation(cell) } },
+        shape: { rows: shape.rows - 1, columns: shape.columns },
+        message: `Deleted row ${cell.rowIndex}`,
+      };
+    }
+    case 'delete_column': {
+      if (shape.columns <= 1) {
+        throw new Error('This table has a single column; deleting the last column deletes the table. Use delete_content over the table\'s range for that.');
+      }
+      const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
+      return {
+        request: { deleteTableColumn: { tableCellLocation: cellLocation(cell) } },
+        shape: { rows: shape.rows, columns: shape.columns - 1 },
+        message: `Deleted column ${cell.columnIndex}`,
+      };
+    }
+    case 'merge_cells':
+    case 'unmerge_cells': {
+      // A merge changes the table, so its extent is never implied; an unmerge is harmless
+      const spans = action === 'merge_cells' ? { row_span: args.row_span ?? 1, column_span: args.column_span ?? 1 } : {};
+      const range = validateCellRange(shape, tableStartIndex, { ...args, ...spans });
+      if (action === 'merge_cells' && range.rowSpan * range.columnSpan < 2) {
+        throw new Error('merge_cells needs a range of more than one cell: set row_span and/or column_span above 1.');
+      }
+      const tableRange = { tableCellLocation: cellLocation(range), rowSpan: range.rowSpan, columnSpan: range.columnSpan };
+      const cells = `${range.rowSpan}x${range.columnSpan} cells from row ${range.rowIndex}, column ${range.columnIndex}`;
+      return {
+        request: action === 'merge_cells' ? { mergeTableCells: { tableRange } } : { unmergeTableCells: { tableRange } },
+        shape,
+        message: action === 'merge_cells' ? `Merged ${cells}` : `Unmerged ${cells}`,
+      };
+    }
+    case 'set_column_width': {
+      const width = args.width_pt;
+      if (width === undefined || !Number.isFinite(width) || width < MIN_COLUMN_WIDTH_PT || width > MAX_COLUMN_WIDTH_PT) {
+        throw new Error(`set_column_width needs width_pt between ${MIN_COLUMN_WIDTH_PT} and ${MAX_COLUMN_WIDTH_PT} points.`);
+      }
+      let columnIndices: number[] | undefined;
+      if (args.column_index !== undefined) {
+        validateCellRange(shape, tableStartIndex, { column_index: args.column_index, row_span: 1, column_span: 1 });
+        columnIndices = [args.column_index];
+      }
+      return {
+        request: {
+          updateTableColumnProperties: {
+            tableStartLocation,
+            ...(columnIndices ? { columnIndices } : {}),
+            tableColumnProperties: { widthType: 'FIXED_WIDTH', width: { magnitude: width, unit: 'PT' } },
+            fields: 'widthType,width',
+          },
+        },
+        shape,
+        message: columnIndices ? `Set column ${columnIndices[0]} to ${width}pt wide` : `Set every column to ${width}pt wide`,
+      };
+    }
+    case 'pin_header_rows': {
+      const pinned = args.pinned_rows;
+      if (pinned === undefined || !Number.isInteger(pinned) || pinned < 0) {
+        throw new Error('pin_header_rows needs pinned_rows: how many top rows repeat on each page, 0 to unpin.');
+      }
+      if (pinned >= shape.rows) {
+        throw new Error(`pinned_rows must leave at least one unpinned row; this table has ${shape.rows} row(s).`);
+      }
+      return {
+        request: { pinTableHeaderRows: { tableStartLocation, pinnedHeaderRowsCount: pinned } },
+        shape,
+        message: pinned === 0 ? 'Unpinned the header rows' : `Pinned the top ${pinned} row(s) as a repeating header`,
+      };
+    }
+  }
+}

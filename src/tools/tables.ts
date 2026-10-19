@@ -11,25 +11,33 @@ import {
 import {
   borderSchema,
   buildTableCellStyle,
+  buildTableModification,
   findTableAt,
-  findTableStartingAt,
   hasMergedCells,
+  locateTable,
   nestingRefusal,
   normalizeTableData,
   styleFailureWarning,
+  tableShape,
   tableStartFor,
+  validateCellRange,
   MAX_CELL_CHARS,
+  MAX_COLUMN_WIDTH_PT,
   MAX_TABLE_COLUMNS,
   MAX_TABLE_ROWS,
+  MIN_COLUMN_WIDTH_PT,
+  TABLE_ACTIONS,
 } from "../lib/tableModel.js";
 import { docLocation, endOfBodyIndex } from "../lib/tabs.js";
 import { log, errorFields } from "../lib/log.js";
 import {
   DOCUMENTS_SCOPE,
   REQUIRED_REVISION_DESCRIPTION,
+  SUGGEST_DESCRIPTION,
   TAB_ID_DESCRIPTION,
   docsBatchUpdate,
   docsOnly,
+  doneMessage,
   fetchResolvedTab,
   toolErrorResponse,
   toolResult,
@@ -58,13 +66,15 @@ async function insertTableAt(
   index: number,
   clearInheritedFormatting: boolean,
   tabId?: string,
+  suggest?: boolean,
 ): Promise<InsertedTable> {
   const columns = tableData[0].length;
+  const writeControl = buildWriteControl(undefined, suggest);
 
   await docsBatchUpdate(documentId, accessToken, [
     { insertTable: { location: docLocation(index, tabId), rows: tableData.length, columns } },
     ...buildTableInsertRequests(tableData, index, tabId),
-  ]);
+  ], writeControl);
 
   const created = {
     rows: tableData.length,
@@ -85,7 +95,7 @@ async function insertTableAt(
     if (table) {
       await docsBatchUpdate(documentId, accessToken, [
         clearInheritedFormattingRequest(table.startIndex + 1, table.endIndex, tabId),
-      ]);
+      ], writeControl);
     }
   } catch (error: any) {
     // Google's error text is untrusted once the model reads it, so it stays in the log.
@@ -140,11 +150,12 @@ export const tableTools = {
     schema: {
       document_id: z.string().describe('Google Doc ID'),
       rows: z.array(z.array(z.string().max(MAX_CELL_CHARS)).max(MAX_TABLE_COLUMNS)).max(MAX_TABLE_ROWS).describe('Table data as array of rows, each row is array of cell strings'),
-      tab_id: z.string().optional().describe(TAB_ID_DESCRIPTION),
+      tab_id: z.string().min(1).optional().describe(TAB_ID_DESCRIPTION),
       clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting on the newly appended table content. Defaults to true.'),
       required_revision_id: z.string().optional().describe('If provided, the initial table insert fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
+      suggest: z.boolean().optional().describe(SUGGEST_DESCRIPTION),
     },
-    handler: requirePermissionSecure(DOCUMENTS_SCOPE, docsOnly(async ({ document_id, rows, tab_id, clear_inherited_formatting, required_revision_id }: any, context: any) => {
+    handler: requirePermissionSecure(DOCUMENTS_SCOPE, docsOnly(async ({ document_id, rows, tab_id, clear_inherited_formatting, required_revision_id, suggest }: any, context: any) => {
       try {
         const { accessToken } = context;
 
@@ -166,7 +177,7 @@ export const tableTools = {
           ...buildTableInsertRequests(tableData, insertIndex, resolved.tabId),
         ];
 
-        await docsBatchUpdate(document_id, accessToken, requests, buildWriteControl(required_revision_id));
+        await docsBatchUpdate(document_id, accessToken, requests, buildWriteControl(required_revision_id, suggest));
 
         // Clear inherited formatting on the newly inserted table — best-effort.
         // The table is already inserted at this point; if this second
@@ -204,7 +215,7 @@ export const tableTools = {
               tableStartIndexVerified = true;
               await docsBatchUpdate(document_id, accessToken, [
                 clearInheritedFormattingRequest(ourTable.startIndex + 1, ourTable.endIndex, resolved.tabId),
-              ]);
+              ], buildWriteControl(undefined, suggest));
             } else if (candidates.length === 0) {
               formattingWarning = 'Could not locate the inserted table to clear formatting (document may have been edited concurrently).';
             } else {
@@ -229,7 +240,7 @@ export const tableTools = {
           columns: maxCols,
           table_start_index: tableStartIndex,
           table_start_index_verified: tableStartIndexVerified,
-          message: `Table inserted with ${tableData.length} rows and ${maxCols} columns`,
+          message: doneMessage(`Table inserted with ${tableData.length} rows and ${maxCols} columns`, suggest),
         };
         if (formattingWarning) {
           output.warning = `Table inserted, but clearing inherited formatting failed: ${formattingWarning}. Do not insert the table again.`;
@@ -248,12 +259,13 @@ export const tableTools = {
       document_id: z.string().describe('Google Doc ID'),
       rows: z.array(z.array(z.string().max(MAX_CELL_CHARS)).max(MAX_TABLE_COLUMNS)).max(MAX_TABLE_ROWS).describe('Table data as array of rows, each row is array of cell strings. Pass empty rows (e.g. [[], [], []]) with columns set to create an empty table.'),
       index: z.number().int().min(1).describe('Document index to insert the table at. 1 is the top of the document body. Use get_document with include_structure=true to find indices.'),
-      tab_id: z.string().optional().describe(TAB_ID_DESCRIPTION),
+      tab_id: z.string().min(1).optional().describe(TAB_ID_DESCRIPTION),
       columns: z.number().int().min(1).max(MAX_TABLE_COLUMNS).optional().describe('Force the table width; short rows are padded with empty cells. Defaults to the widest row. Must not be smaller than the widest row.'),
       clear_inherited_formatting: z.boolean().optional().describe('Clear formatting inherited from the insertion point on the new table content. Defaults to true.'),
       allow_nested: z.boolean().optional().describe('Allow an index that falls inside an existing table, which nests the new table in that cell. Defaults to false, which refuses such an index and tells you which ones would work.'),
+      suggest: z.boolean().optional().describe(SUGGEST_DESCRIPTION),
     },
-    handler: requirePermissionSecure(DOCUMENTS_SCOPE, docsOnly(async ({ document_id, rows, index, tab_id, columns, clear_inherited_formatting, allow_nested }: any, context: any) => {
+    handler: requirePermissionSecure(DOCUMENTS_SCOPE, docsOnly(async ({ document_id, rows, index, tab_id, columns, clear_inherited_formatting, allow_nested, suggest }: any, context: any) => {
       try {
         const { accessToken } = context;
 
@@ -279,13 +291,17 @@ export const tableTools = {
           index,
           clear_inherited_formatting !== false,
           tab_id,
+          suggest,
         );
 
         return toolResult(tableOutput(
           document_id,
           table,
-          `Table inserted with ${table.rows} rows and ${table.columns} columns` +
-            (table.startIndexVerified ? `, starting at index ${table.tableStartIndex}` : ''),
+          doneMessage(
+            `Table inserted with ${table.rows} rows and ${table.columns} columns` +
+              (table.startIndexVerified ? `, starting at index ${table.tableStartIndex}` : ''),
+            suggest,
+          ),
         ));
       } catch (err) {
         return toolErrorResponse(err);
@@ -308,7 +324,7 @@ export const tableTools = {
     schema: {
       document_id: z.string().describe('Google Doc ID'),
       table_start_index: z.number().int().min(1).describe('Start index of the table itself, from insert_table/append_table or a table element in get_document structure. Not the index passed to insert_table, which is one lower.'),
-      tab_id: z.string().optional().describe(TAB_ID_DESCRIPTION),
+      tab_id: z.string().min(1).optional().describe(TAB_ID_DESCRIPTION),
       row_index: z.number().int().min(0).optional().describe('First row of the range, zero-based. Defaults to 0.'),
       column_index: z.number().int().min(0).optional().describe('First column of the range, zero-based. Defaults to 0.'),
       row_span: z.number().int().min(1).optional().describe('How many rows to style. Defaults to the rest of the table.'),
@@ -320,10 +336,11 @@ export const tableTools = {
       border_bottom: borderSchema.optional().describe('Overrides `border` for the bottom side'),
       border_left: borderSchema.optional().describe('Overrides `border` for the left side'),
       content_alignment: z.enum(['TOP', 'MIDDLE', 'BOTTOM']).optional().describe('Vertical alignment of cell content'),
+      suggest: z.boolean().optional().describe(SUGGEST_DESCRIPTION),
     },
     handler: requirePermissionSecure(DOCUMENTS_SCOPE, docsOnly(async (args: any, context: any) => {
       try {
-        const { document_id, table_start_index, tab_id, row_index, column_index, row_span, column_span } = args;
+        const { document_id, table_start_index, tab_id, row_index, column_index, row_span, column_span, suggest } = args;
         const { accessToken } = context;
 
         if (!Number.isInteger(table_start_index)) {
@@ -336,59 +353,10 @@ export const tableTools = {
         }
 
         const { resolved, tabBody } = await fetchResolvedTab(document_id, accessToken, tab_id);
-        const element = findTableStartingAt(tabBody, table_start_index);
-        if (!element) {
-          const tables = (tabBody.body?.content ?? []).filter((c) => c.table);
-          // An index inside a table is a nested table, which the Docs API does not
-          // expose as its own element, so no lookup can ever reach it.
-          const enclosing = tables.find(
-            (c) => (c.startIndex ?? 0) < table_start_index && table_start_index < c.endIndex
-          );
-          if (enclosing) {
-            throw new Error(
-              `Index ${table_start_index} is inside the table at ${enclosing.startIndex}-${enclosing.endIndex}, ` +
-              `so it refers to a table nested in one of its cells. Nested tables cannot be styled. ` +
-              `Style the outer table at ${enclosing.startIndex} instead.`
-            );
-          }
-          const starts = tables.map((c) => c.startIndex);
-          const listed = starts.slice(0, 20).join(', ');
-          const rest = starts.length > 20 ? ` and ${starts.length - 20} more` : '';
-          throw new Error(
-            `No table starts at index ${table_start_index}. ` +
-            (starts.length
-              ? `Tables here start at ${listed}${rest}.`
-              : 'No tables were found.') +
-            (resolved.tabId
-              ? ` Only the tab '${resolved.tabId}' was read; pass a different tab_id for tables in other tabs.`
-              : '')
-          );
-        }
-
-        const rows = element.table?.rows ?? 0;
-        const columns = element.table?.columns ?? 0;
-        const startRow = row_index ?? 0;
-        const startColumn = column_index ?? 0;
-        const size = `The table at index ${table_start_index} has ${rows} rows and ${columns} columns`;
-
-        // Check the start before deriving a span from it, or the default span
-        // goes negative and the range reads backwards.
-        if (startRow >= rows || startColumn >= columns) {
-          throw new Error(
-            `${size}, so row_index ${startRow} and column_index ${startColumn} are out of range. ` +
-            `Both are zero-based, so the last cell is row ${rows - 1}, column ${columns - 1}.`
-          );
-        }
-
-        const rowSpan = row_span ?? rows - startRow;
-        const columnSpan = column_span ?? columns - startColumn;
-
-        if (startRow + rowSpan > rows || startColumn + columnSpan > columns) {
-          throw new Error(
-            `The requested range (rows ${startRow}-${startRow + rowSpan - 1}, columns ${startColumn}-${startColumn + columnSpan - 1}) ` +
-            `does not fit. ${size}.`
-          );
-        }
+        const element = locateTable(tabBody, table_start_index, resolved.tabId);
+        const { rows, columns } = tableShape(element);
+        const { rowIndex: startRow, columnIndex: startColumn, rowSpan, columnSpan } =
+          validateCellRange({ rows, columns }, table_start_index, { row_index, column_index, row_span, column_span });
 
         // The bounds above were checked against this revision, so pin the write to it
         // rather than let Google apply the range to a table a collaborator has resized.
@@ -406,7 +374,7 @@ export const tableTools = {
             tableCellStyle,
             fields: fields.join(','),
           },
-        }], buildWriteControl(tabBody.revisionId));
+        }], buildWriteControl(tabBody.revisionId, suggest));
 
         const requested = rowSpan * columnSpan;
         const output: any = {
@@ -416,7 +384,7 @@ export const tableTools = {
           columns,
           cells_styled: requested,
           applied: fields,
-          message: `Styled ${requested} cell(s) (${fields.join(', ')}) in the table at index ${table_start_index}`,
+          message: doneMessage(`Styled ${requested} cell(s) (${fields.join(', ')}) in the table at index ${table_start_index}`, suggest),
         };
         const warnings: string[] = [];
         if (!tabBody.revisionId) {
@@ -436,6 +404,55 @@ export const tableTools = {
           output.warning = warnings.join(' ');
         }
         return toolResult(output);
+      } catch (err) {
+        return toolErrorResponse(err);
+      }
+    })),
+  },
+
+  modify_table: {
+    description: 'Change the structure of an existing table in a Google Doc: insert or delete a row or column, merge or unmerge cells, set column widths, or pin header rows that repeat on every page. Pass table_start_index, the table\'s own start index from get_document with include_structure=true or from insert_table/append_table. Rows and columns are zero-based. insert_row and insert_column go after the reference cell (below or right) by default, before it with position="before"; delete_row and delete_column remove the reference row or column; merge_cells and unmerge_cells take a rectangular range (row_index, column_index, row_span, column_span; merge spans default to 1, unmerge spans to the rest of the table) and merging keeps the text of every cell, joined into the top-left one; set_column_width takes width_pt for column_index or for every column; pin_header_rows takes pinned_rows (0 unpins). Each call makes one change, pinned to the revision it validated against, so a concurrent edit makes it fail rather than hit the wrong cells. Structural changes shift every index after the table: re-read with get_document before further index-based edits. Native Google Docs only.',
+    outputSchema: {
+      id: z.string(),
+      action: z.enum(TABLE_ACTIONS),
+      table_start_index: z.number(),
+      rows: z.number().describe('Rows after the change'),
+      columns: z.number().describe('Columns after the change'),
+      message: z.string(),
+    },
+    schema: {
+      document_id: z.string().describe('Google Doc ID'),
+      table_start_index: z.number().int().min(1).describe('Start index of the table itself, from get_document structure or insert_table/append_table'),
+      action: z.enum(TABLE_ACTIONS).describe('The change to make'),
+      tab_id: z.string().min(1).optional().describe(TAB_ID_DESCRIPTION),
+      row_index: z.number().int().min(0).optional().describe('Reference row, zero-based. Defaults to 0.'),
+      column_index: z.number().int().min(0).optional().describe('Reference column, zero-based. Defaults to 0. For set_column_width, omit to set every column.'),
+      position: z.enum(['before', 'after']).optional().describe('insert_row / insert_column: insert before (above / left of) or after (below / right of) the reference cell. Defaults to after.'),
+      row_span: z.number().int().min(1).optional().describe('merge_cells / unmerge_cells: rows in the range. Defaults to the rest of the table.'),
+      column_span: z.number().int().min(1).optional().describe('merge_cells / unmerge_cells: columns in the range. Defaults to the rest of the table.'),
+      width_pt: z.number().min(MIN_COLUMN_WIDTH_PT).max(MAX_COLUMN_WIDTH_PT).optional().describe(`set_column_width: width in points (${MIN_COLUMN_WIDTH_PT}-${MAX_COLUMN_WIDTH_PT}); a letter page body is about 468pt wide`),
+      pinned_rows: z.number().int().min(0).optional().describe('pin_header_rows: how many top rows repeat on each page; 0 unpins'),
+      suggest: z.boolean().optional().describe(SUGGEST_DESCRIPTION),
+    },
+    handler: requirePermissionSecure(DOCUMENTS_SCOPE, docsOnly(async (args: any, context: any) => {
+      try {
+        const { document_id, table_start_index, tab_id, suggest } = args;
+        const { accessToken } = context;
+
+        const { resolved, tabBody } = await fetchResolvedTab(document_id, accessToken, tab_id);
+        const element = locateTable(tabBody, table_start_index, resolved.tabId);
+        const change = buildTableModification(tableShape(element), docLocation(table_start_index, resolved.tabId), args);
+
+        await docsBatchUpdate(document_id, accessToken, [change.request], buildWriteControl(tabBody.revisionId, suggest));
+
+        return toolResult({
+          id: document_id,
+          action: args.action,
+          table_start_index,
+          rows: change.shape.rows,
+          columns: change.shape.columns,
+          message: doneMessage(`${change.message} in the table at index ${table_start_index}`, suggest),
+        });
       } catch (err) {
         return toolErrorResponse(err);
       }

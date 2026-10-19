@@ -57,6 +57,7 @@ export interface StructureElement {
   endIndex: number;
   text?: string;
   inlineObjectId?: string;
+  footnoteId?: string;
   headingLevel?: number;
   bullet?: { nestingLevel: number };
   rows?: number;
@@ -65,6 +66,39 @@ export interface StructureElement {
   has_merged_cells?: boolean;
   styles?: ReportedCellStyle[];
   cell_styles?: number[][];
+  suggestions?: Suggestion[];
+}
+
+/** A pending suggestion touching an element, by id, for review_suggestion. */
+export interface Suggestion {
+  id: string;
+  kind: 'insertion' | 'deletion' | 'formatting';
+}
+
+/**
+ * Collect the suggestion ids on a paragraph's runs or on a table, each once,
+ * in the order they appear. Insertions and deletions carry id lists; a
+ * suggested style change is a map keyed by suggestion id under a
+ * `suggested...Changes` field (text style, paragraph style, bullets, cells).
+ */
+export function collectSuggestions(nodes: any[]): Suggestion[] {
+  const out: Suggestion[] = [];
+  const seen = new Set<string>();
+  const add = (id: unknown, kind: Suggestion['kind']) => {
+    if (typeof id !== 'string' || seen.has(id)) return;
+    seen.add(id);
+    out.push({ id, kind });
+  };
+  for (const node of nodes) {
+    if (!node || typeof node !== 'object') continue;
+    for (const id of node.suggestedInsertionIds ?? []) add(id, 'insertion');
+    for (const id of node.suggestedDeletionIds ?? []) add(id, 'deletion');
+    for (const [field, value] of Object.entries(node)) {
+      if (!/^suggested.*Changes$/.test(field) || !value || typeof value !== 'object') continue;
+      for (const id of Object.keys(value)) add(id, 'formatting');
+    }
+  }
+  return out;
 }
 
 /**
@@ -87,19 +121,29 @@ export interface ParsedExport {
   commentLetters: Set<string>;
 }
 
+export interface WriteControl {
+  requiredRevisionId?: string;
+  writeMode?: 'SUGGEST';
+}
+
 /**
  * Build the `writeControl` object for a Docs batchUpdate. When
  * `requiredRevisionId` is provided, Google rejects the write if the document's
  * current revision doesn't match — surfacing optimistic-concurrency conflicts
- * as a 400 instead of silently overwriting a concurrent edit. Returns
- * `undefined` when no constraint was requested so callers can spread it
- * conditionally into the batchUpdate body.
+ * as a 400 instead of silently overwriting a concurrent edit. With `suggest`
+ * every request in the batch lands as a tracked suggestion instead of an edit.
+ * Returns `undefined` when neither was requested so callers can omit it.
  */
 export function buildWriteControl(
   requiredRevisionId: string | undefined,
-): { requiredRevisionId: string } | undefined {
-  if (!requiredRevisionId || typeof requiredRevisionId !== 'string') return undefined;
-  return { requiredRevisionId };
+  suggest = false,
+): WriteControl | undefined {
+  const pinned = Boolean(requiredRevisionId) && typeof requiredRevisionId === 'string';
+  if (!pinned && !suggest) return undefined;
+  return {
+    ...(pinned ? { requiredRevisionId } : {}),
+    ...(suggest ? { writeMode: 'SUGGEST' as const } : {}),
+  };
 }
 
 /**
@@ -195,6 +239,10 @@ export function parseDocumentStructure(
         .join('') || '';
       const headingLevel = namedStyleToHeadingLevel(element.paragraph.paragraphStyle?.namedStyleType);
       const bullet = element.paragraph.bullet;
+      const suggestions = collectSuggestions([
+        element.paragraph,
+        ...(element.paragraph.elements || []).map((el: any) => el.textRun ?? el.inlineObjectElement ?? el.pageBreak ?? el.footnoteReference ?? {}),
+      ]);
       elements.push({
         type: 'paragraph',
         startIndex: element.startIndex ?? 0,
@@ -202,9 +250,10 @@ export function parseDocumentStructure(
         text,
         ...(headingLevel !== undefined ? { headingLevel } : {}),
         ...(bullet ? { bullet: { nestingLevel: bullet.nestingLevel ?? 0 } } : {}),
+        ...(suggestions.length ? { suggestions } : {}),
       });
 
-      // Extract inline images from paragraph elements
+      // Inline images and footnote marks get elements of their own, so their ids are addressable
       for (const el of element.paragraph.elements || []) {
         if (el.inlineObjectElement) {
           elements.push({
@@ -213,10 +262,24 @@ export function parseDocumentStructure(
             endIndex: el.endIndex,
             inlineObjectId: el.inlineObjectElement.inlineObjectId,
           });
+        } else if (el.footnoteReference?.footnoteId) {
+          elements.push({
+            type: 'footnoteReference',
+            startIndex: el.startIndex,
+            endIndex: el.endIndex,
+            footnoteId: el.footnoteReference.footnoteId,
+          });
         }
       }
     } else if (element.table) {
-      elements.push({ type: 'table', ...describeTable(element, budget, includeStyles) });
+      // Suggested rows, cells and cell styles sit on the rows and cells, not on the table
+      const rows = element.table.tableRows ?? [];
+      const suggestions = collectSuggestions([element.table, ...rows, ...rows.flatMap((r: any) => r.tableCells ?? [])]);
+      elements.push({
+        type: 'table',
+        ...describeTable(element, budget, includeStyles),
+        ...(suggestions.length ? { suggestions } : {}),
+      });
     } else if (element.sectionBreak) {
       elements.push({
         type: 'sectionBreak',
@@ -246,10 +309,10 @@ export function parseDocumentStructure(
  * Centralised so all "insert + optionally reset formatting" tools agree on the
  * exact set of fields cleared.
  */
-export function clearInheritedFormattingRequest(startIndex: number, endIndex: number, tabId?: string): any {
+export function clearInheritedFormattingRequest(startIndex: number, endIndex: number, tabId?: string, segmentId?: string): any {
   return {
     updateTextStyle: {
-      range: { startIndex, endIndex, ...(tabId ? { tabId } : {}) },
+      range: { startIndex, endIndex, ...(tabId ? { tabId } : {}), ...(segmentId ? { segmentId } : {}) },
       textStyle: {},
       fields: 'bold,italic,underline,strikethrough,fontSize,foregroundColor,link',
     },
@@ -264,14 +327,91 @@ const LIST_PRESETS: Record<Exclude<ListStyle, 'none'>, string> = {
   checkbox: 'BULLET_CHECKBOX',
 };
 
+/** Google's glyph presets, for callers who want a specific look. */
+export const BULLET_PRESETS = [
+  'BULLET_DISC_CIRCLE_SQUARE', 'BULLET_DIAMONDX_ARROW3D_SQUARE', 'BULLET_CHECKBOX', 'BULLET_ARROW_DIAMOND_DISC',
+  'BULLET_STAR_CIRCLE_SQUARE', 'BULLET_ARROW3D_CIRCLE_SQUARE', 'BULLET_LEFTTRIANGLE_DIAMOND_DISC',
+  'BULLET_DIAMONDX_HOLLOWDIAMOND_SQUARE', 'BULLET_DIAMOND_CIRCLE_SQUARE', 'NUMBERED_DECIMAL_ALPHA_ROMAN',
+  'NUMBERED_DECIMAL_ALPHA_ROMAN_PARENS', 'NUMBERED_DECIMAL_NESTED', 'NUMBERED_UPPERALPHA_ALPHA_ROMAN',
+  'NUMBERED_UPPERROMAN_UPPERALPHA_DECIMAL', 'NUMBERED_ZERODECIMAL_ALPHA_ROMAN',
+] as const;
+
 /**
  * Bullets are their own request type, not a paragraph style field, so they
  * ride alongside updateParagraphStyle in the same batch
  */
-export function listStyleRequest(startIndex: number, endIndex: number, listStyle: ListStyle, tabId?: string): any {
-  const range = { startIndex, endIndex, ...(tabId ? { tabId } : {}) };
+export function listStyleRequest(startIndex: number, endIndex: number, listStyle: ListStyle, tabId?: string, segmentId?: string, preset?: string): any {
+  const range = { startIndex, endIndex, ...(tabId ? { tabId } : {}), ...(segmentId ? { segmentId } : {}) };
   if (listStyle === 'none') return { deleteParagraphBullets: { range } };
-  return { createParagraphBullets: { range, bulletPreset: LIST_PRESETS[listStyle] } };
+  return { createParagraphBullets: { range, bulletPreset: preset ?? LIST_PRESETS[listStyle] } };
+}
+
+export const NAMED_STYLES = ['NORMAL_TEXT', 'TITLE', 'SUBTITLE', 'HEADING_1', 'HEADING_2', 'HEADING_3', 'HEADING_4', 'HEADING_5', 'HEADING_6'] as const;
+
+export interface ParagraphStyleArgs {
+  heading_level?: number;
+  named_style?: string;
+  alignment?: string;
+  line_spacing?: number;
+  space_above_pt?: number;
+  space_below_pt?: number;
+  indent_start_pt?: number;
+  indent_end_pt?: number;
+  indent_first_line_pt?: number;
+  keep_with_next?: boolean;
+  page_break_before?: boolean;
+}
+
+const PARAGRAPH_DIMENSIONS: Array<[keyof ParagraphStyleArgs, string]> = [
+  ['space_above_pt', 'spaceAbove'],
+  ['space_below_pt', 'spaceBelow'],
+  ['indent_start_pt', 'indentStart'],
+  ['indent_end_pt', 'indentEnd'],
+  ['indent_first_line_pt', 'indentFirstLine'],
+];
+
+/** The updateParagraphStyle payload for update_paragraph_style, with its field mask in argument order */
+export function buildParagraphStyle(args: ParagraphStyleArgs): { paragraphStyle: Record<string, unknown>; fields: string[] } {
+  const paragraphStyle: Record<string, unknown> = {};
+  const fields: string[] = [];
+
+  if (args.heading_level !== undefined && args.named_style !== undefined) {
+    throw new Error('Pass one of heading_level or named_style, not both: both set the paragraph\'s named style.');
+  }
+  if (args.heading_level !== undefined) {
+    if (!Number.isInteger(args.heading_level) || args.heading_level < 0 || args.heading_level > 6) {
+      throw new Error('heading_level must be 0 (normal) or 1-6');
+    }
+    paragraphStyle.namedStyleType = args.heading_level === 0 ? 'NORMAL_TEXT' : `HEADING_${args.heading_level}`;
+    fields.push('namedStyleType');
+  }
+  if (args.named_style !== undefined) {
+    paragraphStyle.namedStyleType = args.named_style;
+    fields.push('namedStyleType');
+  }
+  if (args.alignment !== undefined) {
+    paragraphStyle.alignment = args.alignment;
+    fields.push('alignment');
+  }
+  if (args.line_spacing !== undefined) {
+    paragraphStyle.lineSpacing = args.line_spacing;
+    fields.push('lineSpacing');
+  }
+  for (const [arg, field] of PARAGRAPH_DIMENSIONS) {
+    const value = args[arg];
+    if (value === undefined) continue;
+    paragraphStyle[field] = { magnitude: value, unit: 'PT' };
+    fields.push(field);
+  }
+  if (args.keep_with_next !== undefined) {
+    paragraphStyle.keepWithNext = args.keep_with_next;
+    fields.push('keepWithNext');
+  }
+  if (args.page_break_before !== undefined) {
+    paragraphStyle.pageBreakBefore = args.page_break_before;
+    fields.push('pageBreakBefore');
+  }
+  return { paragraphStyle, fields };
 }
 
 export interface TextStyleArgs {
@@ -279,8 +419,12 @@ export interface TextStyleArgs {
   italic?: boolean;
   underline?: boolean;
   strikethrough?: boolean;
+  small_caps?: boolean;
   font_size?: number;
+  font_family?: string;
   color?: string;
+  background_color?: string;
+  baseline_offset?: 'NONE' | 'SUPERSCRIPT' | 'SUBSCRIPT';
   link_url?: string;
 }
 
@@ -298,16 +442,33 @@ export function buildTextStyle(args: TextStyleArgs): { textStyle: Record<string,
     textStyle.fontSize = { magnitude: args.font_size, unit: 'PT' };
     fields.push('fontSize');
   }
+  if (args.font_family !== undefined) {
+    textStyle.weightedFontFamily = { fontFamily: args.font_family };
+    fields.push('weightedFontFamily');
+  }
   if (args.color !== undefined) {
     textStyle.foregroundColor = { color: hexToRgbColor(args.color, 'color') };
     fields.push('foregroundColor');
+  }
+  if (args.background_color !== undefined) {
+    // An empty colour object is how Google clears a highlight
+    textStyle.backgroundColor = args.background_color === '' ? {} : { color: hexToRgbColor(args.background_color, 'background_color') };
+    fields.push('backgroundColor');
+  }
+  if (args.baseline_offset !== undefined) {
+    textStyle.baselineOffset = args.baseline_offset;
+    fields.push('baselineOffset');
+  }
+  if (args.small_caps !== undefined) {
+    textStyle.smallCaps = args.small_caps;
+    fields.push('smallCaps');
   }
   if (args.link_url !== undefined) {
     textStyle.link = args.link_url === '' ? null : { url: args.link_url };
     fields.push('link');
   }
   if (fields.length === 0) {
-    throw new Error('At least one style property must be provided (bold, italic, underline, strikethrough, font_size, color, link_url)');
+    throw new Error('At least one style property must be provided (bold, italic, underline, strikethrough, small_caps, font_size, font_family, color, background_color, baseline_offset, link_url)');
   }
   return { textStyle, fields };
 }
@@ -414,11 +575,15 @@ export function validateIndexRange(startIndex: number, endIndex: number): void {
 
 /**
  * Validate an insertion index. Docs body content starts at index 1 (index 0
- * is the document start sentinel); inserting at 0 always 400s.
+ * is the document start sentinel); inserting at 0 always 400s. Header, footer
+ * and footnote segments have no sentinel, so their text starts at index 0.
  */
-export function validateInsertIndex(index: number): void {
-  if (!Number.isFinite(index) || index < 1) {
-    throw new Error('index must be >= 1 (Docs body starts at index 1)');
+export function validateInsertIndex(index: number, inSegment = false): void {
+  const min = inSegment ? 0 : 1;
+  if (!Number.isFinite(index) || index < min) {
+    throw new Error(inSegment
+      ? 'index must be >= 0 (header, footer and footnote text starts at index 0)'
+      : 'index must be >= 1 (Docs body starts at index 1)');
   }
 }
 

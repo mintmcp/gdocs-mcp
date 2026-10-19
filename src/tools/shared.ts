@@ -7,12 +7,17 @@ import { docsOnly as wrapDocsOnly } from "../lib/word.js";
 import { resolveTab, type ResolvedTab } from "../lib/tabs.js";
 import { type DocsBody } from "../lib/tableModel.js";
 import { GoogleApiError, makeDriveRequest, makeDocsRequest } from "../lib/google.js";
+import { type WriteControl } from "../lib/docs-structure.js";
 
 // Tabs nest at most 3 levels deep, so three tabProperties selectors cover the
 // whole tree without pulling any tab content
 export const TAB_LIST_FIELDS = 'revisionId,tabs.tabProperties,tabs.childTabs.tabProperties,tabs.childTabs.childTabs.tabProperties';
 
 export const TAB_ID_DESCRIPTION = 'ID of the tab to target in a multi-tab document: tabProperties.tabId, the value after ?tab= in the document URL (e.g. "t.abc123"), also listed in get_document\'s `tabs`. Omit to target the first tab.';
+
+export const SUGGEST_DESCRIPTION = 'Make the change as a tracked suggestion (Google Docs "Suggesting" mode) instead of a direct edit, so a reviewer accepts or rejects it in the document. Suggestions show in get_document structure with their ids; review_suggestion accepts or rejects them. Defaults to false.';
+
+export const SEGMENT_ID_DESCRIPTION = 'Target a header, footer or footnote instead of the body: the id get_document reports for it with include_structure=true (headers[].id, footers[].id, footnotes[].id). Indices inside a segment start at 0. Omit for the document body.';
 
 export const REQUIRED_REVISION_DESCRIPTION = 'If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.';
 
@@ -79,6 +84,23 @@ export function toolErrorResponse(err: unknown): { content: Array<{ type: 'text'
   };
 }
 
+/** Write tools report what they did; in suggest mode that is a proposal, not an edit. */
+export function doneMessage(message: string, suggest?: boolean): string {
+  return suggest ? `${message} (as a suggestion, pending review)` : message;
+}
+
+/**
+ * The error envelope for a step that failed after an earlier step already
+ * changed the document: `partialSuccess` plus whatever ids the caller needs to
+ * finish by hand instead of retrying and creating the thing twice.
+ */
+export function partialFailure(err: unknown, prefix: string, extra: Record<string, unknown>) {
+  const base = toolErrorResponse(err);
+  const parsed = JSON.parse(base.content[0].text);
+  const payload = { ...parsed, error: `${prefix}: ${parsed.error}`, partialSuccess: true, ...extra };
+  return { content: [{ type: 'text' as const, text: JSON.stringify(payload) }], isError: true as const };
+}
+
 /** The success envelope every tool returns: the output pretty-printed plus structured. */
 export function toolResult<T>(output: T) {
   return {
@@ -118,7 +140,7 @@ export function docsBatchUpdate(
   documentId: string,
   accessToken: string,
   requests: any[],
-  writeControl?: Record<string, unknown>,
+  writeControl?: WriteControl,
 ): Promise<any> {
   return makeDocsRequest(`/${encodeURIComponent(documentId)}:batchUpdate`, accessToken, {
     method: 'POST',

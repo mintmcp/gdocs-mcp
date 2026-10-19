@@ -210,3 +210,12 @@ describe('appendInsertion', () => {
     expect(appendInsertion(body, 'caption')).toEqual({ index: 2, text: '\ncaption', paragraphStart: 3 });
   });
 });
+
+describe('segment-aware locations', () => {
+  it('adds segmentId only when given, after the tab', () => {
+    expect(docLocation(3, 't.0', 'kix.h')).toEqual({ index: 3, tabId: 't.0', segmentId: 'kix.h' });
+    expect(docLocation(3, undefined, 'kix.h')).toEqual({ index: 3, segmentId: 'kix.h' });
+    expect(docRange(1, 4, undefined, 'kix.h')).toEqual({ startIndex: 1, endIndex: 4, segmentId: 'kix.h' });
+    expect(docRange(1, 4, 't.0')).toEqual({ startIndex: 1, endIndex: 4, tabId: 't.0' });
+  });
+});

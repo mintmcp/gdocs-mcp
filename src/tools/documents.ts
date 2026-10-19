@@ -12,7 +12,7 @@ import {
 } from "../lib/markdownImport.js";
 import { fetchWordMagic, NATIVE_DOC_MIME } from "../lib/word.js";
 import { isWordMime, sniffWordFormat } from "../lib/wordText.js";
-import { GOOGLE_DRIVE_API, safeJsonParse, makeDriveRequest } from '../lib/google.js';
+import { GOOGLE_DRIVE_API, makeDriveRequest } from '../lib/google.js';
 import { log, errorFields } from "../lib/log.js";
 import {
   DOCUMENTS_SCOPE,
@@ -20,6 +20,7 @@ import {
   type DriveFile,
   docsBatchUpdate,
   isConversionRefusal,
+  partialFailure,
   toolErrorResponse,
   toolResult,
 } from './shared.js';
@@ -152,19 +153,10 @@ export const documentTools = {
               },
             }]);
           } catch (insertErr) {
-            const base = toolErrorResponse(insertErr);
-            const parsed = safeJsonParse(base.content[0].text) || {};
-            const payload = {
-              ...parsed,
-              error: `Document was created but inserting body text failed: ${parsed.error ?? String(insertErr)}`,
-              partialSuccess: true,
+            return partialFailure(insertErr, 'Document was created but inserting body text failed', {
               fileId: file.id,
               webViewLink: `https://docs.google.com/document/d/${file.id}`,
-            };
-            return {
-              content: [{ type: 'text', text: JSON.stringify(payload) }],
-              isError: true,
-            };
+            });
           }
         }
 

@@ -27,6 +27,7 @@ import {
   MAX_TEXT_CHARS as MAX_WORD_TEXT_CHARS,
 } from "../lib/wordText.js";
 import { collectInlineObjects, renderStructureText, resolveTab } from "../lib/tabs.js";
+import { listHeaderFooters, segmentText } from "../lib/segments.js";
 import { GOOGLE_DRIVE_API, buildGoogleApiError, makeDriveRequest, makeDocsRequest } from '../lib/google.js';
 import { attachLabelsMeta } from '../lib/driveLabels.js';
 import {
@@ -60,7 +61,8 @@ const structureElementSchema = z.object({
   startIndex: z.number().optional(),
   endIndex: z.number().optional(),
   text: z.string().optional(),
-  inlineObjectId: z.string().optional(),
+  inlineObjectId: z.string().optional().describe('inlineImage only: the id replace_image takes'),
+  footnoteId: z.string().optional().describe('footnoteReference only: the segment_id of the footnote text'),
   headingLevel: z.number().int().min(1).max(6).optional(),
   bullet: z.object({ nestingLevel: z.number().int() }).optional().describe('Paragraph only: present when the paragraph is a list item, with its nesting level (0 = top level).'),
   rows: z.number().optional().describe('Table only: number of rows'),
@@ -69,7 +71,16 @@ const structureElementSchema = z.object({
   has_merged_cells: z.boolean().optional().describe('Table only: the table has merged cells. Positions in `cells` still match columns, since a covered position reads as an empty string, but styling a range may affect cells outside it.'),
   styles: z.array(reportedCellStyleSchema).optional().describe('Table only, with include_table_styles=true: each distinct cell style listed once. Values are in the form update_table_style accepts, so they can be passed straight back.'),
   cell_styles: z.array(z.array(z.number())).optional().describe('Table only, with include_table_styles=true: an index into `styles` for each cell, positioned like `cells`. Cells sharing an index share a look, which is how you find the ranges to pass to update_table_style.'),
+  suggestions: z.array(z.object({ id: z.string(), kind: z.enum(['insertion', 'deletion', 'formatting']) })).optional().describe('Pending suggestions touching this element, by id. Pass the ids to review_suggestion to accept or reject them.'),
 }).passthrough();
+
+const headerFooterSchema = z.object({
+  id: z.string().describe('Pass as segment_id to the editing tools'),
+  type: z.enum(['DEFAULT', 'FIRST_PAGE', 'EVEN_PAGE', 'SECTION']),
+  text: z.string(),
+});
+
+const SUGGESTIONS_VIEW_MODES = ['DEFAULT_FOR_CURRENT_ACCESS', 'SUGGESTIONS_INLINE', 'PREVIEW_SUGGESTIONS_ACCEPTED', 'PREVIEW_WITHOUT_SUGGESTIONS'] as const;
 
 const headingSchema = z.object({
   level: z.number().int().min(1).max(6),
@@ -362,7 +373,7 @@ export const readTools = {
   },
 
   get_document: {
-    description: 'Read the contents of a Google Doc as plain text, or as markdown with format="markdown" (headings, bold, links, lists and tables preserved; best for understanding a formatted document). Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need; pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable; comment threads are document-level, so ones anchored in other tabs are still returned but without `anchor_offset`. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
+    description: 'Read the contents of a Google Doc as plain text, or as markdown with format="markdown" (headings, bold, links, lists and tables preserved; best for understanding a formatted document). Also reads Word (.doc and .docx) files uploaded to Drive, by parsing them directly — for those, `mimeType` is returned and `include_structure`/`include_comments` do not apply. Optionally include document structure with startIndex/endIndex for each element (needed for index-based editing tools like delete_content, insert_text, update_text_style, update_paragraph_style). Table elements in `structure` also carry `rows`, `columns` and `cells` (cell text by row then column), which is how you find the coordinates to pass to update_table_style; a table reporting has_merged_cells=true still lines its positions up with columns, since a merge-covered position reads as an empty string. Add include_table_styles=true to also see how each table is formatted: `styles` lists every distinct cell style once and `cell_styles` gives each cell an index into it, so cells sharing an index share a look. The values are in the form update_table_style accepts, so read a style and pass it straight back to copy a table\'s formatting. One caveat when replaying: a border reported without a `color` is written back as black, since Google needs a complete border, so check that field before copying a border across documents. When include_structure=true, the response also includes a `headings` array (level, text, startIndex, endIndex) to support "insert after the heading named X" flows without parsing the full structure, plus `headers` and `footers` (id, type, text) for the tab being read; their ids are the segment_id the editing tools and set_header_footer work with. Set include_comments=true to also return comment thread metadata (author email, timestamp, replies, emoji reactions). `content` is returned verbatim with no inline markers; each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchored text deleted by later edits) omit `anchor_offset`. If the document uses Tabs, a `tabs` summary (id, title, nesting) is always returned. Pass `tab_id` to read ONE tab: `content`, `structure` and `headings` then all describe that tab, rendered from the same source so the indices are exactly what the editing tools need; pass the same tab_id to those tools. Without `tab_id`, `content` concatenates all tabs (via Drive export) while `structure`/`headings` indices refer to the FIRST tab only, which is also the tab the editing tools target when not given a tab_id. With `tab_id`, tables in `content` render as tab-separated rows and comment reactions are unavailable; comment threads are document-level, so ones anchored in other tabs are still returned but without `anchor_offset`. The response also includes the current `revisionId`; pass it as `required_revision_id` to a subsequent mutating tool to detect concurrent edits (the write will fail rather than silently overwrite). Use search_documents to find a document ID first.',
     readOnlyHint: true,
     outputSchema: {
       id: z.string(),
@@ -376,6 +387,9 @@ export const readTools = {
       message: z.string().optional().describe('Why content is partial, or which options do not apply'),
       structure: z.array(structureElementSchema).optional(),
       headings: z.array(headingSchema).optional(),
+      headers: z.array(headerFooterSchema).optional().describe('With include_structure: the headers of the tab being read, with their ids and text'),
+      footers: z.array(headerFooterSchema).optional().describe('With include_structure: the footers of the tab being read'),
+      footnotes: z.array(z.object({ id: z.string().describe('Pass as segment_id to the editing tools'), text: z.string() })).optional().describe('With include_structure: the footnotes of the tab being read; the footnoteReference elements in `structure` say where each mark sits'),
       tabs: z.array(tabSummarySchema).optional(),
       tab: z.object({
         tabId: z.string(),
@@ -385,13 +399,14 @@ export const readTools = {
     },
     schema: {
       document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
-      tab_id: z.string().optional().describe('Read a single tab of a multi-tab document: tabProperties.tabId, the value after ?tab= in the document URL (e.g. "t.abc123"), also listed in this tool\'s `tabs` output. With tab_id, `content`, `structure` and `headings` all describe that tab and their indices are valid for the editing tools when passed the same tab_id. Without it, `content` concatenates all tabs while structure indices cover only the first tab.'),
+      tab_id: z.string().min(1).optional().describe('Read a single tab of a multi-tab document: tabProperties.tabId, the value after ?tab= in the document URL (e.g. "t.abc123"), also listed in this tool\'s `tabs` output. With tab_id, `content`, `structure` and `headings` all describe that tab and their indices are valid for the editing tools when passed the same tab_id. Without it, `content` concatenates all tabs while structure indices cover only the first tab.'),
       format: z.enum(['text', 'markdown']).optional().describe('"text" (default) returns plain text. "markdown" renders headings, bold, italic, links, lists and tables as markdown; embedded images are replaced with a placeholder (get_document_images returns them) and the result is capped at 200,000 characters. It reads the whole document, so it cannot be combined with tab_id, and comment anchors are plain-text offsets, so it cannot be combined with include_comments.'),
       include_structure: z.boolean().optional().describe('Include document structure with startIndex/endIndex for each element. Required before using index-based tools.'),
       include_table_styles: z.boolean().optional().describe('Also report each table\'s cell styles, as a `styles` legend plus a `cell_styles` index grid. Requires include_structure=true. Use it to see how a table is currently formatted before matching or replicating it.'),
       include_comments: z.boolean().optional().describe('Include comment thread metadata (author email/name, timestamp, replies, resolved status, emoji reactions). `content` is returned verbatim — no inline markers are inserted. Each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchor deleted by later edits) omit `anchor_offset`.'),
+      suggestions_view_mode: z.enum(SUGGESTIONS_VIEW_MODES).optional().describe('How pending suggestions (Google Docs "Suggesting" mode) appear in `structure`, `headings` and per-tab `content`: SUGGESTIONS_INLINE (the default for editors) shows suggested insertions and still-pending deletions as text, with their ids in each element\'s `suggestions`; PREVIEW_SUGGESTIONS_ACCEPTED shows the document as if every suggestion were accepted; PREVIEW_WITHOUT_SUGGESTIONS as if every one were rejected. The whole-document `content` export never includes pending suggestions, so on a document with suggestions read one tab with tab_id, or pass PREVIEW_WITHOUT_SUGGESTIONS, for indices that match it.'),
     },
-    handler: requirePermissionSecure(DRIVE_READONLY_SCOPE, attachLabelsMeta((a: any) => a.document_id, async ({ document_id, tab_id, format, include_structure, include_comments, include_table_styles }: any, context: any) => {
+    handler: requirePermissionSecure(DRIVE_READONLY_SCOPE, attachLabelsMeta((a: any) => a.document_id, async ({ document_id, tab_id, format, include_structure, include_comments, include_table_styles, suggestions_view_mode }: any, context: any) => {
       try {
         const { accessToken } = context;
         const asMarkdown = format === 'markdown';
@@ -401,6 +416,9 @@ export const readTools = {
         ];
         if (asMarkdown && markdownConflicts.length > 0) {
           throw new Error(`format "markdown" cannot be combined with ${markdownConflicts.join(' or ')}. Drop format or the other option.`);
+        }
+        if (suggestions_view_mode && !include_structure && !tab_id) {
+          throw new Error('suggestions_view_mode only affects the Docs read behind `structure` and per-tab `content`; pass include_structure=true or tab_id with it, since the whole-document export never includes pending suggestions.');
         }
 
         // Get file metadata for title and link
@@ -457,12 +475,13 @@ export const readTools = {
         }
 
         const needsDocsContent = Boolean(include_structure || tab_id);
+        const viewMode = suggestions_view_mode ? `&suggestionsViewMode=${suggestions_view_mode}` : '';
         let doc: any;
         let docsFetchNote: string | undefined;
         try {
           doc = await makeDocsRequest(
             needsDocsContent
-              ? `/${encodeURIComponent(document_id)}?includeTabsContent=true`
+              ? `/${encodeURIComponent(document_id)}?includeTabsContent=true${viewMode}`
               : `/${encodeURIComponent(document_id)}?fields=${TAB_LIST_FIELDS}`,
             accessToken, { method: 'GET' });
         } catch (docsErr) {
@@ -541,6 +560,12 @@ export const readTools = {
         if (parsed && resolved && include_structure) {
           output.structure = parsed.elements;
           output.headings = extractHeadings(resolved.body);
+          const headers = listHeaderFooters('header', resolved.documentStyle, resolved.headers);
+          const footers = listHeaderFooters('footer', resolved.documentStyle, resolved.footers);
+          const footnotes = Object.entries(resolved.footnotes).map(([id, note]) => ({ id, text: segmentText(note) }));
+          if (headers.length) output.headers = headers;
+          if (footers.length) output.footers = footers;
+          if (footnotes.length) output.footnotes = footnotes;
           if (parsed.tablesWithoutCells > 0) {
             notes.push(`${parsed.tablesWithoutCells} table(s) report dimensions without cell contents because the document exhausted the structure budget for table cells. Their text, if any, is in \`content\`.`);
           }
@@ -564,7 +589,7 @@ export const readTools = {
     readOnlyHint: true,
     schema: {
       document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
-      tab_id: z.string().optional().describe('Only extract images from this tab: tabProperties.tabId, the value after ?tab= in the document URL, also listed in get_document\'s `tabs`. Omit for all tabs.'),
+      tab_id: z.string().min(1).optional().describe('Only extract images from this tab: tabProperties.tabId, the value after ?tab= in the document URL, also listed in get_document\'s `tabs`. Omit for all tabs.'),
     },
     handler: requirePermissionSecure(DRIVE_READONLY_SCOPE, attachLabelsMeta((a: any) => a.document_id, async ({ document_id, tab_id }: any, context: any) => {
       try {

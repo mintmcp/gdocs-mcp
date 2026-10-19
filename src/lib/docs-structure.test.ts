@@ -496,3 +496,18 @@ describe('compactMarkdownExport', () => {
     expect(compactMarkdownExport('abcd', 4)).toEqual({ content: 'abcd', imagesOmitted: 0, truncated: false });
   });
 });
+
+describe('buildWriteControl suggest mode', () => {
+  it('adds writeMode SUGGEST, with or without a revision pin', () => {
+    expect(buildWriteControl(undefined, true)).toEqual({ writeMode: 'SUGGEST' });
+    expect(buildWriteControl('rev-1', true)).toEqual({ requiredRevisionId: 'rev-1', writeMode: 'SUGGEST' });
+    expect(buildWriteControl('rev-1', false)).toEqual({ requiredRevisionId: 'rev-1' });
+  });
+});
+
+describe('validateInsertIndex in a segment', () => {
+  it('allows index 0, where header and footer text starts', () => {
+    expect(() => validateInsertIndex(0, true)).not.toThrow();
+    expect(() => validateInsertIndex(-1, true)).toThrow(/index must be >= 0/);
+  });
+});
