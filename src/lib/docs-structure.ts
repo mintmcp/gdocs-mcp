@@ -241,7 +241,8 @@ export function parseDocumentStructure(
 
 /**
  * Build a Docs API `updateTextStyle` request that clears inherited character
- * formatting (bold, italic, underline, strikethrough, link) on the given range.
+ * formatting (bold, italic, underline, strikethrough, font size, colour, link)
+ * on the given range.
  * Centralised so all "insert + optionally reset formatting" tools agree on the
  * exact set of fields cleared.
  */
@@ -518,4 +519,22 @@ export function findLetterByContent(
     if (normalizeForMatch(content) === target) return letter;
   }
   return undefined;
+}
+
+export const MAX_MARKDOWN_CHARS = 200_000;
+
+const EMBEDDED_IMAGE_RE = /data:image\/[\w.+-]+;base64,[A-Za-z0-9+/=]+/g;
+
+/**
+ * Drive's markdown export inlines every image as a base64 data URI, which can
+ * run to megabytes for a few screenshots; get_document_images serves those
+ */
+export function compactMarkdownExport(markdown: string, maxChars = MAX_MARKDOWN_CHARS): { content: string; imagesOmitted: number; truncated: boolean } {
+  let imagesOmitted = 0;
+  const stripped = markdown.replace(EMBEDDED_IMAGE_RE, () => {
+    imagesOmitted++;
+    return 'embedded-image-omitted';
+  });
+  const truncated = stripped.length > maxChars;
+  return { content: truncated ? stripped.slice(0, maxChars) : stripped, imagesOmitted, truncated };
 }

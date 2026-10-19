@@ -17,6 +17,7 @@ import {
   listStyleRequest,
   buildTextStyle,
   clearInheritedParagraphStyleRequests,
+  compactMarkdownExport,
 } from './docs-structure.js';
 
 /**
@@ -477,5 +478,21 @@ describe('parseDocumentStructure list items', () => {
     expect(elements[0].bullet).toBeUndefined();
     expect(elements[1].bullet).toEqual({ nestingLevel: 0 });
     expect(elements[2].bullet).toEqual({ nestingLevel: 1 });
+  });
+});
+
+describe('compactMarkdownExport', () => {
+  it('replaces embedded base64 images with a placeholder and counts them', () => {
+    const md = '![][image1]\n\n[image1]: <data:image/png;base64,iVBORw0KGgo=>\n![x](data:image/jpeg;base64,/9j/4AAQ+/=)';
+    expect(compactMarkdownExport(md)).toEqual({
+      content: '![][image1]\n\n[image1]: <embedded-image-omitted>\n![x](embedded-image-omitted)',
+      imagesOmitted: 2,
+      truncated: false,
+    });
+  });
+
+  it('caps the text after stripping images', () => {
+    expect(compactMarkdownExport('abcdef', 4)).toEqual({ content: 'abcd', imagesOmitted: 0, truncated: true });
+    expect(compactMarkdownExport('abcd', 4)).toEqual({ content: 'abcd', imagesOmitted: 0, truncated: false });
   });
 });

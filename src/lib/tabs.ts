@@ -109,7 +109,8 @@ export function appendInsertion(body: any[], text: string): { index: number; tex
   const elements: any[] = body[body.length - 1]?.paragraph?.elements ?? [];
   const lastHasContent = elements.some((el) => el.textRun ? el.textRun.content.replace(/\n$/, '') !== '' : true);
   const separate = lastHasContent && !text.startsWith('\n');
-  return { index, text: separate ? `\n${text}` : text, paragraphStart: separate ? index + 1 : index };
+  // A caller's own leading newline also ends the existing paragraph, so the new one starts after it
+  return { index, text: separate ? `\n${text}` : text, paragraphStart: lastHasContent ? index + 1 : index };
 }
 
 /**

@@ -197,7 +197,7 @@ describe('appendInsertion', () => {
 
   it('does not add a separator when the last paragraph is empty or the text brings its own', () => {
     expect(appendInsertion([para('alpha\n', 1, 7), para('\n', 7, 8)], 'beta')).toEqual({ index: 7, text: 'beta', paragraphStart: 7 });
-    expect(appendInsertion([para('alpha\n', 1, 7)], '\nbeta')).toEqual({ index: 6, text: '\nbeta', paragraphStart: 6 });
+    expect(appendInsertion([para('alpha\n', 1, 7)], '\nbeta')).toEqual({ index: 6, text: '\nbeta', paragraphStart: 7 });
   });
 
   it('writes into a table-terminated body without a separator', () => {

@@ -9,6 +9,8 @@ import {
   buildWriteControl,
   clearInheritedFormattingRequest,
   clearInheritedParagraphStyleRequests,
+  compactMarkdownExport,
+  MAX_MARKDOWN_CHARS,
   escapeDriveQueryName,
   extractHeadings,
   findLetterByContent,
@@ -671,7 +673,7 @@ export class GoogleDocsTools {
         schema: {
           document_id: z.string().describe('Google Doc ID (from search_documents or a Google Docs URL)'),
           tab_id: z.string().optional().describe('Read a single tab of a multi-tab document: tabProperties.tabId, the value after ?tab= in the document URL (e.g. "t.abc123"), also listed in this tool\'s `tabs` output. With tab_id, `content`, `structure` and `headings` all describe that tab and their indices are valid for the editing tools when passed the same tab_id. Without it, `content` concatenates all tabs while structure indices cover only the first tab.'),
-          format: z.enum(['text', 'markdown']).optional().describe('"text" (default) returns plain text. "markdown" renders headings, bold, italic, links, lists and tables as markdown; it reads the whole document, so it cannot be combined with tab_id, and comment anchors are plain-text offsets, so it cannot be combined with include_comments.'),
+          format: z.enum(['text', 'markdown']).optional().describe('"text" (default) returns plain text. "markdown" renders headings, bold, italic, links, lists and tables as markdown; embedded images are replaced with a placeholder (get_document_images returns them) and the result is capped at 200,000 characters. It reads the whole document, so it cannot be combined with tab_id, and comment anchors are plain-text offsets, so it cannot be combined with include_comments.'),
           include_structure: z.boolean().optional().describe('Include document structure with startIndex/endIndex for each element. Required before using index-based tools.'),
           include_table_styles: z.boolean().optional().describe('Also report each table\'s cell styles, as a `styles` legend plus a `cell_styles` index grid. Requires include_structure=true. Use it to see how a table is currently formatted before matching or replicating it.'),
           include_comments: z.boolean().optional().describe('Include comment thread metadata (author email/name, timestamp, replies, resolved status, emoji reactions). `content` is returned verbatim — no inline markers are inserted. Each thread carries `anchor_offset: { start, end }` — a half-open span into `content` indicating which text the comment was attached to. Threads with no findable position (document-level comments, or anchor deleted by later edits) omit `anchor_offset`.'),
@@ -760,6 +762,8 @@ export class GoogleDocsTools {
             const parsed = resolved ? parseDocumentStructure(resolved.body, include_table_styles === true) : undefined;
 
             let content: string;
+            const markdownNotes: string[] = [];
+            let markdownTruncated = false;
             if (parsed && tab_id) {
               content = renderStructureText(parsed.elements);
             } else {
@@ -779,6 +783,17 @@ export class GoogleDocsTools {
               }
 
               content = await response.text();
+              if (asMarkdown) {
+                const compacted = compactMarkdownExport(content);
+                content = compacted.content;
+                markdownTruncated = compacted.truncated;
+                if (compacted.imagesOmitted > 0) {
+                  markdownNotes.push(`${compacted.imagesOmitted} embedded image(s) were replaced with "embedded-image-omitted"; get_document_images returns them.`);
+                }
+                if (compacted.truncated) {
+                  markdownNotes.push(`The markdown was truncated at ${MAX_MARKDOWN_CHARS} characters. Use format "text" or read one tab with tab_id for the rest.`);
+                }
+              }
             }
 
             const output: any = {
@@ -801,6 +816,7 @@ export class GoogleDocsTools {
 
             output.content = content;
             if (asMarkdown) output.format = 'markdown';
+            if (markdownTruncated) output.truncated = true;
 
             const tabs = summarizeTabs(doc?.tabs);
             if (tabs.length > 0) output.tabs = tabs;
@@ -808,6 +824,7 @@ export class GoogleDocsTools {
 
             const notes: string[] = [];
             if (docsFetchNote) notes.push(docsFetchNote);
+            notes.push(...markdownNotes);
             if (parsed && resolved && include_structure) {
               output.structure = parsed.elements;
               output.headings = extractHeadings(resolved.body);
@@ -1134,7 +1151,7 @@ export class GoogleDocsTools {
       },
 
       insert_text: {
-        description: 'Insert text at a specific position in a Google Doc. Use get_document with include_structure=true to find the correct index. NOTE: Inserted text inherits formatting from surrounding text at the insertion point. Use clear_inherited_formatting=true to reset to plain formatting. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
+        description: 'Insert text at a specific position in a Google Doc. Use get_document with include_structure=true to find the correct index. NOTE: Inserted text inherits formatting from surrounding text at the insertion point. Use clear_inherited_formatting=true to reset character formatting (bold, italic, underline, strikethrough, font size, colour, link); paragraph styles such as a heading or list are kept. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
@@ -1144,7 +1161,7 @@ export class GoogleDocsTools {
           text: z.string().describe('Text to insert'),
           index: z.coerce.number().int().describe('Position to insert at (use get_document with include_structure to find indices)'),
           tab_id: z.string().optional().describe(TAB_ID_DESCRIPTION),
-          clear_inherited_formatting: z.boolean().optional().describe('Clear inherited formatting from surrounding text on the newly inserted content. Defaults to false.'),
+          clear_inherited_formatting: z.boolean().optional().describe('Clear character formatting inherited from surrounding text on the newly inserted content; heading and list paragraph styles are kept. Defaults to false.'),
           required_revision_id: z.string().optional().describe('If provided, the write fails with a 400 if the document revision has changed since this revisionId. Use the `revisionId` returned by get_document(include_structure=true) for optimistic concurrency control.'),
         },
         handler: requirePermissionSecure("https://www.googleapis.com/auth/documents", docsOnly(async ({ document_id, text, index, tab_id, clear_inherited_formatting, required_revision_id }: any, context: any) => {
@@ -1243,7 +1260,7 @@ export class GoogleDocsTools {
       },
 
       update_paragraph_style: {
-        description: 'Apply paragraph formatting (heading level, alignment, list style) to a range in a Google Doc. list_style turns every paragraph in the range into bullet, numbered or checkbox list items, or removes bullets with "none"; nesting follows the paragraphs\' existing indentation. Use get_document with include_structure=true to find the correct indices. WARNING: Setting heading_level applies a named style that resets character-level formatting (bold, italic, etc.). If you also need to apply text styles, call update_paragraph_style first, then apply text styles after. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
+        description: 'Apply paragraph formatting (heading level, alignment, list style) to a range in a Google Doc. list_style turns every paragraph in the range into bullet, numbered or checkbox list items, or removes bullets with "none"; nesting comes from leading tab characters, which Google removes, so indices after the range can shift; re-read the structure with get_document before further index-based edits. Use get_document with include_structure=true to find the correct indices. WARNING: Setting heading_level applies a named style that resets character-level formatting (bold, italic, etc.). If you also need to apply text styles, call update_paragraph_style first, then apply text styles after. Optionally pass `required_revision_id` (from get_document with include_structure=true) to fail the write if the document was edited concurrently.',
         outputSchema: {
           id: z.string(),
           message: z.string(),
