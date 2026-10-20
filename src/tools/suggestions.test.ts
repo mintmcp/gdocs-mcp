@@ -1,10 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { batchBody, callTool, errorText, paragraph, stubDoc } from "../lib/mcpHarness.js";
+import { batchBody, callTool, errorText, paragraph, stubDoc, stubRefusal, TITLE_DOC } from "../lib/mcpHarness.js";
 
-const DOC = {
-  revisionId: "rev-1",
-  body: { content: [{ startIndex: 0, endIndex: 1, sectionBreak: {} }, paragraph("Title\n", 1)] },
-};
+const DOC = TITLE_DOC;
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -18,6 +15,15 @@ describe("suggest mode on write tools", () => {
     expect(result.isError).toBeFalsy();
     expect(batchBody(calls).writeControl).toEqual({ requiredRevisionId: "rev-1", writeMode: "SUGGEST" });
     expect((result.structuredContent as any).message).toMatch(/as a suggestion/);
+  });
+
+  it("reports a partial failure when Google committed the edit but saved no suggestion", async () => {
+    stubDoc(DOC, { replies: [{}], commentUpdateState: "ALL_FAILED_UNKNOWN_REASON" });
+    const result = await callTool("insert_text", { text: "x", index: 1, suggest: true });
+    const payload = JSON.parse((result.content as any)[0].text);
+    expect(result.isError).toBe(true);
+    expect(payload).toMatchObject({ partialSuccess: true, commentUpdateState: "ALL_FAILED_UNKNOWN_REASON" });
+    expect(payload.error).toMatch(/direct edit/);
   });
 
   it("sends no writeControl at all when neither is asked for", async () => {
@@ -34,10 +40,10 @@ describe("suggest mode on write tools", () => {
     ["update_paragraph_style", { startIndex: 1, endIndex: 3, alignment: "CENTER" }],
     ["insert_table", { rows: [["a"]], index: 1, clear_inherited_formatting: false }],
   ])("%s accepts suggest", async (tool, args) => {
-    const calls = stubDoc({ ...DOC, replies: [] });
+    const calls = stubDoc(DOC);
     const result = await callTool(tool, { ...args, suggest: true });
     expect(result.isError).toBeFalsy();
-    expect(batchBody(calls).writeControl).toEqual({ writeMode: "SUGGEST" });
+    expect(batchBody(calls).writeControl).toMatchObject({ writeMode: "SUGGEST" });
   });
 });
 
@@ -85,6 +91,12 @@ describe("review_suggestion", () => {
     await callTool("review_suggestion", { suggestion_ids: ["suggest.a"], action: "delete" });
     expect(batchBody(deleted).requests).toEqual([{ deleteSuggestion: { suggestionId: "suggest.a" } }]);
   });
+
+  it("points at the suggestion ids when Google answers 404", async () => {
+    stubRefusal(DOC, "Requested entity was not found.", 404);
+    const result = await callTool("review_suggestion", { suggestion_ids: ["suggest.gone"], action: "accept" });
+    expect(errorText(result)).toMatch(/access it\. If the document opens, a suggestion id is unknown or already resolved/);
+  });
 });
 
 describe("get_document suggestions", () => {
@@ -118,12 +130,14 @@ describe("get_document suggestions", () => {
       { id: "suggest.del", kind: "deletion" },
     ]);
     expect(structure[2].suggestions).toEqual([{ id: "suggest.tbl", kind: "insertion" }]);
+    expect((result.structuredContent as any).message).toMatch(/do not pass them to the editing tools/);
   });
 
   it("omits suggestions on elements that have none", async () => {
     stubDoc(SUGGESTED_DOC);
     const result = await callTool("get_document", { include_structure: true });
     expect((result.structuredContent as any).structure[0]).not.toHaveProperty("suggestions");
+    expect(result.structuredContent).not.toHaveProperty("message");
   });
 });
 
@@ -165,5 +179,32 @@ describe("table suggestions", () => {
     });
     const output = (await callTool("get_document", { include_structure: true })).structuredContent as any;
     expect(output.structure[0].suggestions).toEqual([{ id: "suggest.row", kind: "insertion" }, { id: "suggest.cell", kind: "formatting" }]);
+  });
+});
+
+describe("unsaved comments and suggestions", () => {
+  it("calls a failed comment save on a plain write retryable, since nothing was suggested", async () => {
+    stubDoc(DOC, { replies: [{}], commentUpdateState: "ALL_FAILED_UNKNOWN_REASON" });
+    const result = await callTool("review_suggestion", { suggestion_ids: ["suggest.a"], action: "accept" });
+    const payload = JSON.parse((result.content as any)[0].text);
+    expect(payload.error).toMatch(/saved none of the comments/);
+    expect(payload).not.toHaveProperty("partialSuccess");
+  });
+});
+
+describe("index validation", () => {
+  it("refuses empty insert_text and a body range starting at 0, but allows 0 in a segment", async () => {
+    stubDoc(DOC);
+    expect((await callTool("insert_text", { text: "", index: 1 })).isError).toBe(true);
+    stubDoc(DOC);
+    expect(errorText(await callTool("delete_content", { startIndex: 0, endIndex: 2 }))).toMatch(/Docs body starts at index 1/);
+    const calls = stubDoc(DOC);
+    expect((await callTool("delete_content", { startIndex: 0, endIndex: 2, segment_id: "kix.h" })).isError).toBeFalsy();
+    expect(batchBody(calls).requests[0].deleteContentRange.range).toEqual({ startIndex: 0, endIndex: 2, segmentId: "kix.h" });
+  });
+
+  it("refuses page_break_before in a header", async () => {
+    stubDoc(DOC);
+    expect(errorText(await callTool("update_paragraph_style", { startIndex: 0, endIndex: 2, segment_id: "kix.h", page_break_before: true }))).toMatch(/body paragraphs only/);
   });
 });

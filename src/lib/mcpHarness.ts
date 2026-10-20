@@ -4,16 +4,17 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../server.js";
 import { requestContext } from "../auth.js";
 import { jsonResponse, stubFetch } from "./labelStubs.js";
+import { paragraph } from "./__fixtures__/index.js";
 
 export const DOC_METADATA = { name: "Doc", mimeType: "application/vnd.google-apps.document", webViewLink: "https://docs.google.com/document/d/doc1" };
 
-export const paragraph = (text: string, startIndex: number, extra: Record<string, unknown> = {}) => ({
-  startIndex,
-  endIndex: startIndex + text.length,
-  paragraph: { elements: [{ startIndex, endIndex: startIndex + text.length, textRun: { content: text } }], ...extra },
-});
+export { paragraph };
 
-/** Calls one tool over an in-memory MCP transport with a fake access token. */
+export const TITLE_DOC = {
+  revisionId: "rev-1",
+  body: { content: [{ startIndex: 0, endIndex: 1, sectionBreak: {} }, paragraph("Title\n", 1)] },
+};
+
 export async function callTool(name: string, args: Record<string, unknown>) {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test", version: "0.0.0" });
@@ -25,21 +26,27 @@ export async function callTool(name: string, args: Record<string, unknown>) {
   );
 }
 
-/** Stubs the Drive metadata read and text export, the Docs document read and every batchUpdate for doc1. */
-export function stubDoc(doc: unknown, batchReply: unknown = {}) {
+function stubDocWithBatch(doc: unknown, batch: () => Response) {
   return stubFetch([
     ["/drive/v3/files/doc1?", () => jsonResponse(DOC_METADATA)],
     ["/export?mimeType=", () => new Response("exported text", { status: 200 })],
-    [":batchUpdate", () => jsonResponse(batchReply)],
+    [":batchUpdate", batch],
     ["docs.googleapis.com/v1/documents/doc1", () => jsonResponse(doc)],
   ]);
+}
+
+export function stubDoc(doc: unknown, batchReply: unknown = {}) {
+  return stubDocWithBatch(doc, () => jsonResponse(batchReply));
+}
+
+export function stubRefusal(doc: unknown, message: string, code = 400) {
+  return stubDocWithBatch(doc, () => jsonResponse({ error: { code, message } }, code));
 }
 
 export function batchBodies(calls: Array<{ url: string; init?: RequestInit }>) {
   return calls.filter(({ url }) => url.endsWith(":batchUpdate")).map(({ init }) => JSON.parse(String(init?.body)));
 }
 
-/** The single batchUpdate body a call sent. */
 export function batchBody(calls: Array<{ url: string; init?: RequestInit }>) {
   const bodies = batchBodies(calls);
   expect(bodies).toHaveLength(1);

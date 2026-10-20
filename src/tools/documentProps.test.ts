@@ -1,39 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { batchBody, callTool, errorText, paragraph, stubDoc } from "../lib/mcpHarness.js";
-import { jsonResponse, stubFetch } from "../lib/labelStubs.js";
+import { batchBody, callTool, errorText, stubDoc, TITLE_DOC } from "../lib/mcpHarness.js";
 
-const DOC = {
-  revisionId: "rev-1",
-  body: { content: [{ startIndex: 0, endIndex: 1, sectionBreak: {} }, paragraph("Title\n", 1)] },
-};
+const DOC = TITLE_DOC;
 
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-});
-
-describe("rename_document", () => {
-  it("patches the Drive name and returns the new one", async () => {
-    const calls = stubFetch([
-      ["/drive/v3/files/doc1?", (url) => jsonResponse(url.includes("fields=name,mimeType")
-        ? { name: "Old", mimeType: "application/vnd.google-apps.document", webViewLink: "https://docs.google.com/document/d/doc1" }
-        : { id: "doc1", name: "New name", webViewLink: "https://docs.google.com/document/d/doc1" })],
-    ]);
-    const result = await callTool("rename_document", { name: "New name" });
-    expect(result.isError).toBeFalsy();
-    const patch = calls.find(({ init }) => init?.method === "PATCH");
-    expect(patch?.url).toContain("/drive/v3/files/doc1?");
-    expect(patch?.url).toContain("supportsAllDrives=true");
-    expect(JSON.parse(String(patch?.init?.body))).toEqual({ name: "New name" });
-    expect(result.structuredContent).toMatchObject({ id: "doc1", name: "New name", previous_name: "Old" });
-  });
-
-  it("refuses an empty or whitespace name and a Word upload", async () => {
-    stubDoc(DOC);
-    expect(errorText(await callTool("rename_document", { name: "   " }))).toMatch(/name/);
-    stubFetch([["/drive/v3/files/doc1?", () => jsonResponse({ name: "x.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", webViewLink: "https://drive.google.com/file/d/doc1/view" })]]);
-    expect(errorText(await callTool("rename_document", { name: "y" }))).toMatch(/Word/);
-  });
 });
 
 describe("update_document_style", () => {
@@ -54,7 +26,7 @@ describe("update_document_style", () => {
       useFirstPageHeaderFooter: true,
       pageNumberStart: 3,
     });
-    expect(fields).toBe("marginTop,marginBottom,marginLeft,marginRight,pageSize,useFirstPageHeaderFooter,pageNumberStart");
+    expect(fields).toBe("marginTop,marginBottom,marginLeft,marginRight,useFirstPageHeaderFooter,pageNumberStart,pageSize");    expect(batchBody(calls)).not.toHaveProperty("writeControl");
   });
 
   it("flips the current page size when only the orientation changes", async () => {
@@ -63,6 +35,7 @@ describe("update_document_style", () => {
     expect(batchBody(calls).requests[0].updateDocumentStyle.documentStyle).toEqual({
       pageSize: { width: { magnitude: 792, unit: "PT" }, height: { magnitude: 612, unit: "PT" } },
     });
+    expect(batchBody(calls).writeControl).toEqual({ requiredRevisionId: DOC.revisionId });
   });
 
   it("targets a tab and needs at least one property", async () => {
@@ -70,6 +43,7 @@ describe("update_document_style", () => {
     const calls = stubDoc(tabbed);
     await callTool("update_document_style", { margin_top_pt: 10, tab_id: "t.0" });
     expect(batchBody(calls).requests[0].updateDocumentStyle.tabId).toBe("t.0");
+    expect(calls.some(({ url }) => url.includes("docs.googleapis.com/v1/documents/doc1?"))).toBe(false);
     stubDoc(DOC);
     expect(errorText(await callTool("update_document_style", {}))).toMatch(/At least one/);
   });

@@ -1,10 +1,5 @@
-/**
- * Headers, footers and footnotes are "segments": bodies of their own with
- * indices that start at 0 and end on a newline Google will not let anyone
- * delete. These helpers read them and build the requests that rewrite them.
- */
-
-import { docLocation, docRange } from './tabs.js';
+import { docLocation, docRange } from './docRequests.js';
+import { contentSuggestions, renderBodyText, type Suggestion } from './docs-structure.js';
 
 export interface Segment {
   content?: any[];
@@ -12,17 +7,16 @@ export interface Segment {
 
 export type HeaderFooterKind = 'header' | 'footer';
 
-/** Everything that differs between a header and a footer in Google's requests and replies. */
 export const HEADER_FOOTER = {
   header: {
-    defaultIdField: 'defaultHeaderId',
+    roleIdFields: { DEFAULT: 'defaultHeaderId', FIRST_PAGE: 'firstPageHeaderId', EVEN_PAGE: 'evenPageHeaderId' },
     idKey: 'headerId',
     createRequest: 'createHeader',
     deleteRequest: 'deleteHeader',
     segments: (tab: { headers: Record<string, Segment> }) => tab.headers,
   },
   footer: {
-    defaultIdField: 'defaultFooterId',
+    roleIdFields: { DEFAULT: 'defaultFooterId', FIRST_PAGE: 'firstPageFooterId', EVEN_PAGE: 'evenPageFooterId' },
     idKey: 'footerId',
     createRequest: 'createFooter',
     deleteRequest: 'deleteFooter',
@@ -30,29 +24,21 @@ export const HEADER_FOOTER = {
   },
 } as const;
 
-export interface HeaderFooterSummary {
+export interface SegmentSummary {
   id: string;
-  type: 'DEFAULT' | 'FIRST_PAGE' | 'EVEN_PAGE' | 'SECTION';
   text: string;
+  suggestions?: Suggestion[];
 }
 
-/** The ids documentStyle points at; any other header or footer belongs to a section. */
-const ROLE_FIELDS: Record<HeaderFooterKind, Array<[string, HeaderFooterSummary['type']]>> = {
-  header: [['defaultHeaderId', 'DEFAULT'], ['firstPageHeaderId', 'FIRST_PAGE'], ['evenPageHeaderId', 'EVEN_PAGE']],
-  footer: [['defaultFooterId', 'DEFAULT'], ['firstPageFooterId', 'FIRST_PAGE'], ['evenPageFooterId', 'EVEN_PAGE']],
-};
-
-export function segmentText(segment: Segment | undefined): string {
-  let out = '';
-  for (const el of segment?.content ?? []) {
-    for (const run of el.paragraph?.elements ?? []) {
-      out += run.textRun?.content ?? '';
-    }
-  }
-  return out;
+export interface HeaderFooterSummary extends SegmentSummary {
+  type: 'DEFAULT' | 'FIRST_PAGE' | 'EVEN_PAGE' | 'SECTION';
 }
 
-/** Index of the segment's final newline, which is also the end of what may be deleted. */
+export function summarizeSegment(id: string, segment: Segment | undefined): SegmentSummary {
+  const suggestions = contentSuggestions(segment?.content ?? []);
+  return { id, text: renderBodyText(segment?.content ?? []), ...(suggestions.length ? { suggestions } : {}) };
+}
+
 export function segmentEndIndex(segment: Segment | undefined): number {
   const content = segment?.content ?? [];
   const last = content[content.length - 1];
@@ -65,19 +51,17 @@ export function listHeaderFooters(
   segments: Record<string, Segment> | undefined,
 ): HeaderFooterSummary[] {
   const roles = new Map<string, HeaderFooterSummary['type']>();
-  for (const [field, type] of ROLE_FIELDS[kind]) {
+  for (const [type, field] of Object.entries(HEADER_FOOTER[kind].roleIdFields)) {
     const id = documentStyle?.[field];
-    if (typeof id === 'string') roles.set(id, type);
+    if (typeof id === 'string') roles.set(id, type as HeaderFooterSummary['type']);
   }
   const out: HeaderFooterSummary[] = [];
   for (const [id, segment] of Object.entries(segments ?? {})) {
-    out.push({ id, type: roles.get(id) ?? 'SECTION', text: segmentText(segment) });
+    out.push({ ...summarizeSegment(id, segment), type: roles.get(id) ?? 'SECTION' });
   }
-  // DEFAULT first, then the rest in Google's order
   return out.sort((a, b) => Number(b.type === 'DEFAULT') - Number(a.type === 'DEFAULT'));
 }
 
-/** Replace everything in a segment with `text`; empty text clears it. */
 export function replaceSegmentTextRequests(segment: Segment | undefined, segmentId: string, text: string, tabId?: string): any[] {
   const requests: any[] = [];
   const end = segmentEndIndex(segment);

@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'vitest';
 import { SCOPES, grantedScopes, expandScopes } from './scopes.js';
 import { createServer } from './server.js';
-import { GoogleDocsTools } from './tools.js';
+import { TOOL_DEFINITIONS } from './tools.js';
 
 describe('grantedScopes', () => {
   test('unset profile means unrestricted', () => {
@@ -35,7 +35,7 @@ function toolNames(granted: Set<string> | null): string[] {
   return Object.keys((server as any)._registeredTools ?? {}).sort();
 }
 
-const ALL_TOOLS = Object.keys(GoogleDocsTools.getTools()).sort();
+const ALL_TOOLS = Object.keys(TOOL_DEFINITIONS).sort();
 
 describe('createServer tool surface', () => {
   test('unrestricted registers every tool', () => {

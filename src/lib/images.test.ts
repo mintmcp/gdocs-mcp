@@ -31,3 +31,17 @@ describe('imageObjectSize', () => {
     expect(imageObjectSize()).toEqual({});
   });
 });
+
+describe('imageSourceUrl Drive link forms', () => {
+  it('reads multi-account and docs.google.com links and keeps the resource key', () => {
+    expect(imageSourceUrl('https://drive.google.com/file/u/1/d/1AbC_dEf/view')).toBe('https://drive.google.com/uc?export=download&id=1AbC_dEf');
+    expect(imageSourceUrl('https://docs.google.com/uc?id=1AbC_dEf')).toBe('https://drive.google.com/uc?export=download&id=1AbC_dEf');
+    expect(imageSourceUrl('https://drive.google.com/file/d/1AbC_dEf/view?resourcekey=0-xyz'))
+      .toBe('https://drive.google.com/uc?export=download&id=1AbC_dEf&resourcekey=0-xyz');
+  });
+
+  it('leaves other Drive pages and look-alike hosts alone', () => {
+    expect(imageSourceUrl('https://drive.google.com/drive/folders/abc')).toBe('https://drive.google.com/drive/folders/abc');
+    expect(imageSourceUrl('https://drive.google.com.evil.example/file/d/1AbC/view')).toBe('https://drive.google.com.evil.example/file/d/1AbC/view');
+  });
+});

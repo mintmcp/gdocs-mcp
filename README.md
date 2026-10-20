@@ -3,7 +3,7 @@
 A hosted MCP server that wraps the Google Docs and Drive APIs, packaged for
 the [MintMCP](https://mintmcp.com) hosted runtime. Speaks streamable HTTP on
 port 8000, reads the per-request user access token from the
-`Authorization: Bearer <token>` header, and exposes 25 tools across document
+`Authorization: Bearer <token>` header, and exposes 24 tools across document
 discovery, reading, editing, structure, commenting, suggestions and images.
 
 ## Auth contract
@@ -26,7 +26,7 @@ secrets — there is no per-deployment configuration to inject.
 | `https://www.googleapis.com/auth/userinfo.email` | User email |
 | `https://www.googleapis.com/auth/userinfo.profile` | User profile |
 | `https://www.googleapis.com/auth/drive.readonly` | List/search docs, fetch metadata, read comments |
-| `https://www.googleapis.com/auth/drive.file` | Create new docs in a folder |
+| `https://www.googleapis.com/auth/drive.file` | Create docs in a folder, convert Word uploads |
 | `https://www.googleapis.com/auth/documents` | Read/write document content |
 | `https://www.googleapis.com/auth/drive.labels.readonly` | Optional, `labels` profile only: label enrichment (see below) |
 
@@ -50,7 +50,7 @@ scope gates the enrichment below, not a tool.
 On deployments whose grant includes `drive.labels.readonly`, `get_document`
 and `get_document_images` attach the document's applied Drive labels as
 `_meta.applied`, one entry per label, `{labelId, revisionId, title,
-resolved, values[], skippedValueTypes?}`, the same tree the gdrive-mcp
+resolved, values[], skippedValueTypes?}`, the same tree the Drive
 connector emits (`src/lib/driveLabels.ts` is vendored from it; keep them
 identical). Labels stay in `_meta` only: this connector has no metadata
 tool, the labels-enabled Drive connector is the fleet's visible label
@@ -60,16 +60,16 @@ code instead of failing the read. Without the scope no label call is made
 and no `_meta` is returned; absence means "surfacing not enabled", never
 "no labels".
 
-## Tool surface (25 tools)
+## Tool surface (24 tools)
 
 - **Discovery** — `search_documents`
 - **Read** — `get_document` (plain text, or markdown via `format: "markdown"`; optional `include_structure`, `include_comments`, per-tab reads via `tab_id`, `suggestions_view_mode`; structure lists headers, footers and pending suggestion ids), `get_document_images`
-- **Create / document** — `create_document` (optional initial body, optional parent folder), `convert_to_google_doc`, `rename_document`, `update_document_style` (margins, page size, orientation, first-page header, page number start), `manage_tab` (add, rename, delete)
+- **Create / document** — `create_document` (optional initial body, optional parent folder), `convert_to_google_doc`, `update_document_style` (margins, page size, orientation, first-page header, page number start), `manage_tab` (add, rename, delete)
 - **Insert / append text** — `insert_text` (index-based, into the body or a header, footer or footnote via `segment_id`), `append_text` (end-of-doc, as a new paragraph), `insert_break` (page or section), `insert_footnote`, `set_header_footer`
 - **Update text** — `replace_text` (optionally by regex), `delete_content`, `update_text_style` (bold/italic/underline/strikethrough/small caps/font size and family/colour/highlight/super- and subscript/link), `update_paragraph_style` (heading level or named style, alignment, lists with any bullet preset, line spacing, spacing, indents, keep-with-next, page break before)
 - **Tables** — `append_table`, `insert_table` (with reverse-order cell insertion), `update_table_style` (cell backgrounds, borders, alignment), `modify_table` (insert/delete rows and columns, merge/unmerge cells, column widths, pinned header rows)
 - **Images** — `insert_image` (by URL), `replace_image`
-- **Collaboration** — `add_comment` (new thread or reply), `review_suggestion` (accept, reject, delete); the content-editing tools (`append_text`, `insert_text`, `replace_text`, `delete_content`, `update_text_style`, `update_paragraph_style`, `append_table`, `insert_table`, `update_table_style`, `modify_table`, `insert_break`, `insert_image`) take `suggest: true` to land their change as a tracked suggestion
+- **Collaboration** — `add_comment` (new thread or reply), `review_suggestion` (accept, reject, delete); the content-editing tools (`append_text`, `insert_text`, `replace_text`, `delete_content`, `update_text_style`, `update_paragraph_style`, `append_table`, `insert_table`, `update_table_style`, `modify_table`, `insert_break`, `insert_image`) take `suggest: true` to land their change as a tracked suggestion, except a column width, which Google does not accept as one. When Google applies a suggested edit but fails to save the suggestion, the tool reports a partial failure, not a success; any other write whose comments Google fails to save is a plain, retryable error
 
 The tool modules live under `src/tools/`, one file per domain, assembled by
 `src/tools.ts`.
@@ -117,9 +117,14 @@ hosted-cli build-and-deploy mintmcp/gdocs-mcp:latest
 npm install
 npm run dev      # tsx watch on src/index.ts
 npm run build    # tsc to dist/
-npm test         # vitest unit tests (pure helpers)
+npm test         # vitest: the pure helpers, plus every tool driven over an in-memory MCP client
 npm run smoke    # docker build + protocol smoke test (requires Docker)
 ```
 
-Pure document-structure helpers live in `src/lib/docs-structure.ts` and are
-covered by `src/lib/docs-structure.test.ts` (42 tests).
+Each tool module under `src/tools/` builds its tools with `defineTool` or
+`editTool` from `src/tools/shared.ts`, which own the scope gate, the Word
+upload refusal and the error envelope, and type each handler's arguments from
+its own schema. The pure helpers sit under `src/lib/`:
+`docs-structure.ts` reads a document, `docRequests.ts` builds the batchUpdate
+requests that write one, and `exportText.ts` parses Drive's export text. Each
+has a test file next to it.

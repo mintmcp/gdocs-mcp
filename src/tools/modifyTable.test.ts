@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { batchBody, callTool, errorText, paragraph, stubDoc } from "../lib/mcpHarness.js";
+import { batchBodies, batchBody, callTool, errorText, paragraph, stubDoc, stubRefusal } from "../lib/mcpHarness.js";
 
 const cell = (text: string, start: number) => ({ content: [paragraph(text, start)], tableCellStyle: { rowSpan: 1, columnSpan: 1 } });
 
@@ -73,6 +73,38 @@ describe("modify_table rows and columns", () => {
     expect(errorText(await call({ action: "delete_row", row_index: 0 }))).toMatch(/last row/);
   });
 
+  it("counts every row a merged cell spans as deleted, and refuses when that is the whole table", async () => {
+    const merged = (rowSpan: number, columnSpan: number) => {
+      const rows = TABLE.table.tableRows.map((r) => ({ tableCells: r.tableCells.map((c) => ({ ...c })) }));
+      rows[0].tableCells[1] = { ...rows[0].tableCells[1], tableCellStyle: { rowSpan, columnSpan } };
+      return { ...DOC, body: { content: [DOC.body.content[0], DOC.body.content[1], { ...TABLE, table: { ...TABLE.table, tableRows: rows } }, DOC.body.content[3]] } };
+    };
+
+    stubDoc(merged(1, 2));
+    const cols = await call({ action: "delete_column", column_index: 2 });
+    expect(cols.structuredContent).toMatchObject({ rows: 2, columns: 1 });
+    expect((cols.structuredContent as any).message).toMatch(/columns 1-2, which the merged cell/);
+
+    stubDoc(merged(2, 1));
+    expect(errorText(await call({ action: "delete_row", row_index: 1, column_index: 1 }))).toMatch(/merged across rows 0-1.*whole table/);
+
+    stubDoc(merged(2, 1));
+    expect((await call({ action: "delete_row", row_index: 1, column_index: 0 })).structuredContent).toMatchObject({ rows: 1 });
+  });
+
+  it("reports where an insert next to a merged cell lands: beside the whole merge", async () => {
+    const rows = TABLE.table.tableRows.map((r) => ({ tableCells: r.tableCells.map((c) => ({ ...c })) }));
+    rows[0].tableCells[1] = { ...rows[0].tableCells[1], tableCellStyle: { rowSpan: 2, columnSpan: 1 } };
+    const doc = { ...DOC, body: { content: [DOC.body.content[0], DOC.body.content[1], { ...TABLE, table: { ...TABLE.table, tableRows: rows } }, DOC.body.content[3]] } };
+
+    stubDoc(doc);
+    const below = await call({ action: "insert_row", row_index: 0, column_index: 1 });
+    expect((below.structuredContent as any).message).toMatch(/below rows 0-1, which the merged cell .*; the new row is row 2/);
+    stubDoc(doc);
+    const above = await call({ action: "insert_row", row_index: 1, column_index: 0, position: "before" });
+    expect((above.structuredContent as any).message).toMatch(/above row 1; the new row is row 1/);
+  });
+
   it("rejects a cell outside the table", async () => {
     stubDoc(DOC);
     expect(errorText(await call({ action: "insert_row", row_index: 2 }))).toMatch(/2 rows and 3 columns/);
@@ -124,6 +156,9 @@ describe("modify_table merges, widths and pinned rows", () => {
     expect(batchBody(all).requests[0].updateTableColumnProperties).not.toHaveProperty("columnIndices");
     stubDoc(DOC);
     expect(errorText(await call({ action: "set_column_width" }))).toMatch(/width_pt/);
+    const suggested = stubDoc(DOC);
+    expect(errorText(await call({ action: "set_column_width", width_pt: 72, suggest: true }))).toMatch(/without suggest/);
+    expect(batchBodies(suggested)).toHaveLength(0);
   });
 
   it("pins header rows and unpins with 0", async () => {
@@ -131,7 +166,7 @@ describe("modify_table merges, widths and pinned rows", () => {
     await call({ action: "pin_header_rows", pinned_rows: 1 });
     expect(batchBody(pinned).requests).toEqual([{ pinTableHeaderRows: { tableStartLocation: { index: 8 }, pinnedHeaderRowsCount: 1 } }]);
     stubDoc(DOC);
-    expect(errorText(await call({ action: "pin_header_rows", pinned_rows: 2 }))).toMatch(/leave at least one/);
+    expect(errorText(await call({ action: "pin_header_rows", pinned_rows: 3 }))).toMatch(/only 2 row/);
   });
 
   it("carries the tab on every location and supports suggest", async () => {
@@ -144,5 +179,12 @@ describe("modify_table merges, widths and pinned rows", () => {
     const body = batchBody(calls);
     expect(body.requests[0].insertTableColumn.tableCellLocation.tableStartLocation).toEqual({ index: 8, tabId: "t.0" });
     expect(body.writeControl).toEqual({ requiredRevisionId: "rev-1", writeMode: "SUGGEST" });
+  });
+});
+
+describe("modify_table refusals from Google", () => {
+  it("names the pinned header rows when Google calls a merge non-rectangular", async () => {
+    stubRefusal(DOC, "Invalid requests[0].mergeTableCells: A non-rectangular collection of cells cannot be merged.");
+    expect(errorText(await call({ action: "merge_cells", row_index: 0, row_span: 2 }))).toMatch(/non-rectangular.*pinned header rows/);
   });
 });

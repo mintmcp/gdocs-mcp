@@ -1,4 +1,4 @@
-/** The updateDocumentStyle payload: page size, margins and header/footer options. */
+import { buildStyle, pt, type StyleField } from './docRequests.js';
 
 export const PAGE_SIZES = {
   LETTER: { width: 612, height: 792 },
@@ -22,32 +22,20 @@ export interface DocumentStyleArgs {
   page_number_start?: number;
 }
 
-const MARGINS: Array<[keyof DocumentStyleArgs, string]> = [
-  ['margin_top_pt', 'marginTop'],
-  ['margin_bottom_pt', 'marginBottom'],
-  ['margin_left_pt', 'marginLeft'],
-  ['margin_right_pt', 'marginRight'],
+const DOCUMENT_STYLE_FIELDS: Array<StyleField<DocumentStyleArgs>> = [
+  { arg: 'margin_top_pt', field: 'marginTop', encode: pt },
+  { arg: 'margin_bottom_pt', field: 'marginBottom', encode: pt },
+  { arg: 'margin_left_pt', field: 'marginLeft', encode: pt },
+  { arg: 'margin_right_pt', field: 'marginRight', encode: pt },
+  { arg: 'first_page_header_footer', field: 'useFirstPageHeaderFooter' },
+  { arg: 'page_number_start', field: 'pageNumberStart' },
 ];
 
-const pt = (magnitude: number) => ({ magnitude, unit: 'PT' });
-
-/**
- * `current` is the document's pageSize, needed when only the orientation
- * changes: the page keeps its dimensions and swaps them.
- */
 export function buildDocumentStyle(
   args: DocumentStyleArgs,
   current: { width?: { magnitude?: number }; height?: { magnitude?: number } } | undefined,
 ): { documentStyle: Record<string, unknown>; fields: string[] } {
-  const documentStyle: Record<string, unknown> = {};
-  const fields: string[] = [];
-
-  for (const [arg, field] of MARGINS) {
-    const value = args[arg];
-    if (value === undefined) continue;
-    documentStyle[field] = pt(value as number);
-    fields.push(field);
-  }
+  const { style: documentStyle, fields } = buildStyle(DOCUMENT_STYLE_FIELDS, args);
 
   if (args.page_size !== undefined || args.orientation !== undefined) {
     let { width, height } = args.page_size
@@ -63,14 +51,8 @@ export function buildDocumentStyle(
     documentStyle.pageSize = { width: pt(width), height: pt(height) };
     fields.push('pageSize');
   }
-
-  if (args.first_page_header_footer !== undefined) {
-    documentStyle.useFirstPageHeaderFooter = args.first_page_header_footer;
-    fields.push('useFirstPageHeaderFooter');
-  }
-  if (args.page_number_start !== undefined) {
-    documentStyle.pageNumberStart = args.page_number_start;
-    fields.push('pageNumberStart');
+  if (fields.length === 0) {
+    throw new Error(`At least one property must be provided (${[...DOCUMENT_STYLE_FIELDS.map((f) => f.arg), 'page_size', 'orientation'].join(', ')}).`);
   }
 
   return { documentStyle, fields };

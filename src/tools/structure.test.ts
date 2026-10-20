@@ -21,13 +21,16 @@ describe("insert_break", () => {
     expect(batchBody(calls).requests).toEqual([{ insertPageBreak: { location: { index: 3 } } }]);
   });
 
-  it("appends a section break at the end of the tab when no index is given", async () => {
+  it("appends a break before the final newline and makes the paragraph after it body text", async () => {
     const calls = stubDoc(DOC);
     const result = await callTool("insert_break", { type: "section_next_page", tab_id: undefined });
     expect(result.isError).toBeFalsy();
-    expect(batchBody(calls).requests).toEqual([
-      { insertSectionBreak: { sectionType: "NEXT_PAGE", endOfSegmentLocation: {} } },
-    ]);
+    expect(batchBody(calls).writeControl).toEqual({ targetRevisionId: DOC.revisionId });
+    const [insert, removeBullets, normal] = batchBody(calls).requests;
+    const end = DOC.body.content[DOC.body.content.length - 1].endIndex - 1;
+    expect(insert).toEqual({ insertSectionBreak: { sectionType: "NEXT_PAGE", location: { index: end } } });
+    expect(removeBullets).toEqual({ deleteParagraphBullets: { range: { startIndex: end + 2, endIndex: end + 3 } } });
+    expect(normal.updateParagraphStyle).toMatchObject({ paragraphStyle: { namedStyleType: "NORMAL_TEXT" }, fields: "namedStyleType,alignment,lineSpacing,spaceAbove,spaceBelow,indentStart,indentEnd,indentFirstLine,keepWithNext,pageBreakBefore" });
   });
 
   it("continuous sections and suggest mode", async () => {
@@ -52,11 +55,7 @@ describe("set_header_footer", () => {
   };
 
   it("creates the header when the document has none, then writes the text into it", async () => {
-    const calls = stubFetch([
-      ["/drive/v3/files/doc1?", () => jsonResponse(DOC_METADATA)],
-      [":batchUpdate", (url) => jsonResponse(url ? { replies: [{ createHeader: { headerId: "kix.new" } }] } : {})],
-      ["docs.googleapis.com/v1/documents/doc1", () => jsonResponse(DOC)],
-    ]);
+    const calls = stubDoc(DOC, { replies: [{ createHeader: { headerId: "kix.new" } }] });
     const result = await callTool("set_header_footer", { kind: "header", text: "Confidential" });
     expect(result.isError).toBeFalsy();
     const [create, write] = batchBodies(calls);
@@ -73,6 +72,7 @@ describe("set_header_footer", () => {
       { deleteContentRange: { range: { startIndex: 0, endIndex: 10, segmentId: "kix.h1" } } },
       { insertText: { location: { index: 0, segmentId: "kix.h1" }, text: "New" } },
     ]);
+    expect(batchBody(calls).writeControl).toEqual({ targetRevisionId: WITH_HEADER.revisionId });
     expect(result.structuredContent).toMatchObject({ segment_id: "kix.h1", created: false });
   });
 
@@ -88,11 +88,14 @@ describe("set_header_footer", () => {
     expect(result.structuredContent).toMatchObject({ removed: true });
   });
 
-  it("says when there is nothing to remove, and needs text or remove", async () => {
+  it("says when there is nothing to remove, and needs exactly one of text or remove", async () => {
     stubDoc(DOC);
     expect(errorText(await callTool("set_header_footer", { kind: "footer", remove: true }))).toMatch(/no footer/);
     stubDoc(DOC);
-    expect(errorText(await callTool("set_header_footer", { kind: "footer" }))).toMatch(/text or remove/);
+    expect(errorText(await callTool("set_header_footer", { kind: "footer" }))).toMatch(/exactly one of text or remove/);
+    const calls = stubDoc(WITH_HEADER);
+    expect(errorText(await callTool("set_header_footer", { kind: "header", text: "x", remove: true }))).toMatch(/exactly one of text or remove/);
+    expect(batchBodies(calls)).toEqual([]);
   });
 
   it("targets the tab's footer on a tabbed document", async () => {
@@ -110,7 +113,6 @@ describe("set_header_footer", () => {
     const calls = stubDoc(tabbed);
     const result = await callTool("set_header_footer", { kind: "footer", text: "Page", tab_id: "t.0" });
     expect(result.isError).toBeFalsy();
-    // An empty footer holds only its newline, so nothing is deleted first
     expect(batchBody(calls).requests).toEqual([
       { insertText: { location: { index: 0, tabId: "t.0", segmentId: "kix.f1" }, text: "Page" } },
     ]);
@@ -119,16 +121,12 @@ describe("set_header_footer", () => {
 
 describe("insert_footnote", () => {
   it("creates the footnote at the index, then writes its text into the new segment", async () => {
-    const calls = stubFetch([
-      ["/drive/v3/files/doc1?", () => jsonResponse(DOC_METADATA)],
-      [":batchUpdate", () => jsonResponse({ replies: [{ createFootnote: { footnoteId: "kix.fn" } }] })],
-      ["docs.googleapis.com/v1/documents/doc1", () => jsonResponse(DOC)],
-    ]);
+    const calls = stubDoc(DOC, { replies: [{ createFootnote: { footnoteId: "kix.fn" } }] });
     const result = await callTool("insert_footnote", { index: 6, text: "See appendix." });
     expect(result.isError).toBeFalsy();
     const [create, write] = batchBodies(calls);
     expect(create.requests).toEqual([{ createFootnote: { location: { index: 6 } } }]);
-    expect(write.requests).toEqual([{ insertText: { location: { index: 0, segmentId: "kix.fn" }, text: "See appendix." } }]);
+    expect(write.requests).toEqual([{ insertText: { location: { index: 1, segmentId: "kix.fn" }, text: "See appendix." } }]);
     expect(result.structuredContent).toMatchObject({ id: "doc1", footnote_id: "kix.fn" });
   });
 

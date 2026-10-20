@@ -1,10 +1,5 @@
-/**
- * Google Docs table mechanics: reading tables out of a document and building the
- * requests that create or style them. Pure translation to and from Google's
- * representation, so nothing here performs IO or knows about MCP.
- */
-
-import { z } from 'zod';
+import { buildStyle, docLocation, hexToRgbColor, pt, type StyleField } from './docRequests.js';
+import { BORDER_SIDES, type CellRange, type DocsTableElement, type TableLayout, type TableShape } from './tableRead.js';
 
 // Bound what we build for Google; an oversized payload would otherwise exhaust the isolate.
 export const MAX_TABLE_ROWS = 1000;
@@ -13,28 +8,7 @@ export const MAX_TABLE_CELLS = 10_000;
 export const MAX_CELL_CHARS = 10_000;
 export const MAX_TABLE_TEXT_CHARS = 500_000;
 
-// `content` already carries the full document, so table cells in the structure
-// output are for locating coordinates, not for a second copy of the text.
-export const MAX_STRUCTURE_CELL_CHARS = 200;
-export const MAX_STRUCTURE_TABLE_CHARS = 100_000;
-export const MAX_STRUCTURE_CELLS = 10_000;
-
 export const MAX_BORDER_WIDTH_PT = 20;
-
-export interface DocsTableElement {
-  table?: {
-    rows?: number;
-    columns?: number;
-    tableRows?: Array<{ tableCells?: Array<{ content?: any[]; tableCellStyle?: any }> }>;
-  };
-  startIndex?: number;
-  endIndex: number;
-}
-
-export interface DocsBody {
-  revisionId?: string;
-  body?: { content?: DocsTableElement[] };
-}
 
 /** insertTable writes a newline before the table, so it starts one past the index. */
 export const tableStartFor = (index: number) => index + 1;
@@ -43,266 +17,47 @@ export const tableStartFor = (index: number) => index + 1;
  * Takes a table's own start index, not the insertion index findTableAt takes.
  * insert_table's index is one below the table it creates; these must not be conflated.
  */
-export function findTableStartingAt(doc: DocsBody, tableStartIndex: number): DocsTableElement | undefined {
-  return (doc?.body?.content ?? []).find((c) => c.table && c.startIndex === tableStartIndex);
+function findTableStartingAt(content: DocsTableElement[], tableStartIndex: number): DocsTableElement | undefined {
+  return content.find((c) => c.table && c.startIndex === tableStartIndex);
 }
 
-/** Exact start only: a looser match could style a table we did not create. */
-export function findTableAt(doc: DocsBody, index: number): { startIndex: number; endIndex: number } | undefined {
-  const el = findTableStartingAt(doc, tableStartFor(index));
-  return el ? { startIndex: el.startIndex!, endIndex: el.endIndex } : undefined;
+// Exact start and shape only: a looser match could style a table a collaborator put there
+export function findTableAt(content: DocsTableElement[], index: number, shape: TableShape): { startIndex: number; endIndex: number } | undefined {
+  const el = findTableStartingAt(content, tableStartFor(index));
+  if (!el || el.table?.rows !== shape.rows || el.table?.columns !== shape.columns) return undefined;
+  return { startIndex: el.startIndex!, endIndex: el.endIndex };
 }
 
-/** Google's tableRange is not guaranteed rectangular once cells are merged. */
-export function hasMergedCells(element: DocsTableElement): boolean {
-  return (element?.table?.tableRows ?? []).some((row) =>
-    (row.tableCells ?? []).some(
-      (c) => (c.tableCellStyle?.rowSpan ?? 1) > 1 || (c.tableCellStyle?.columnSpan ?? 1) > 1
-    )
-  );
-}
+// Reverse order so no insert shifts a later one; cell (r, c) sits at index + 4 + r * (2 * cols + 1) + 2 * c
+export function buildTableInsertRequests(
+  tableData: string[][],
+  tableInsertIndex: number,
+  tabId?: string,
+): any[] {
+  const requests: any[] = [];
+  const numRows = tableData.length;
+  if (numRows === 0) return requests;
+  const numCols = tableData[0]?.length ?? 0;
+  if (numCols === 0) return requests;
 
-/** A nested table contributes no paragraph, so it reads as empty rather than recursing. */
-export function cellText(cellContent: any[]): string {
-  let text = '';
-  for (const el of cellContent || []) {
-    for (const run of el.paragraph?.elements || []) {
-      text += (run.textRun?.content || '').slice(0, MAX_STRUCTURE_CELL_CHARS + 1);
-      if (text.length > MAX_STRUCTURE_CELL_CHARS) {
-        return `${text.slice(0, MAX_STRUCTURE_CELL_CHARS)}...`;
+  for (let row = numRows - 1; row >= 0; row--) {
+    const rowIndex = 3 + row * 2 * numCols + row;
+    for (let col = numCols - 1; col >= 0; col--) {
+      const insertIndex = rowIndex + col * 2 + 1 + tableInsertIndex;
+      const text = String(tableData[row][col]);
+      if (text) {
+        requests.push({
+          insertText: {
+            text,
+            location: docLocation(insertIndex, tabId),
+          },
+        });
       }
     }
   }
-  return text.replace(/\n$/, '');
+
+  return requests;
 }
-
-export interface CollectedCells {
-  cells: string[][];
-  size: number;
-  count: number;
-  complete: boolean;
-}
-
-/**
- * Read a table's cells, stopping the moment either budget would be crossed so a
- * document cannot drive unbounded work. `complete` is false when it stopped early.
- */
-export function collectCells(
-  element: DocsTableElement,
-  textBudget: number,
-  cellBudget: number
-): CollectedCells {
-  const cells: string[][] = [];
-  let size = 0;
-  let count = 0;
-
-  for (const row of element.table?.tableRows ?? []) {
-    const built: string[] = [];
-    for (const c of row.tableCells ?? []) {
-      const text = cellText(c.content ?? []);
-      size += text.length;
-      count += 1;
-      if (size > textBudget || count > cellBudget) {
-        return { cells, size, count, complete: false };
-      }
-      built.push(text);
-    }
-    cells.push(built);
-  }
-
-  return { cells, size, count, complete: true };
-}
-
-export interface TableStructure {
-  startIndex: number;
-  endIndex: number;
-  rows?: number;
-  columns?: number;
-  cells?: string[][];
-  has_merged_cells?: boolean;
-  styles?: ReportedCellStyle[];
-  cell_styles?: number[][];
-}
-
-/**
- * Both budgets span the whole document rather than each table, since per-table
- * caps would let many small tables rebuild the same unbounded walk. Once spent
- * they stay spent, so no later table is walked at all.
- */
-export interface StructureBudget {
-  text: number;
-  cells: number;
-  spent: boolean;
-  tablesWithoutCells: number;
-  tablesWithoutStyles: number;
-}
-
-export const newStructureBudget = (): StructureBudget => ({
-  text: MAX_STRUCTURE_TABLE_CHARS,
-  cells: MAX_STRUCTURE_CELLS,
-  spent: false,
-  tablesWithoutCells: 0,
-  tablesWithoutStyles: 0,
-});
-
-/** Describes one table and charges what it reports to the document budget. */
-export function describeTable(
-  element: DocsTableElement,
-  budget: StructureBudget,
-  includeStyles: boolean
-): TableStructure {
-  const entry: TableStructure = {
-    // Google omits startIndex on the first element of the body.
-    startIndex: element.startIndex ?? 0,
-    endIndex: element.endIndex,
-    rows: element.table?.rows,
-    columns: element.table?.columns,
-  };
-
-  const collected = budget.spent ? undefined : collectCells(element, budget.text, budget.cells);
-  if (!collected?.complete) {
-    budget.spent = true;
-    budget.tablesWithoutCells += 1;
-    if (includeStyles) budget.tablesWithoutStyles += 1;
-    return entry;
-  }
-
-  budget.text -= collected.size;
-  budget.cells -= collected.count;
-  entry.cells = collected.cells;
-  if (hasMergedCells(element)) {
-    entry.has_merged_cells = true;
-  }
-
-  if (includeStyles) {
-    // Styles come out of the same budget so one flag cannot quietly multiply
-    // the size of the response.
-    const styled = collectCellStyles(element);
-    if (styled.size > budget.text) {
-      budget.tablesWithoutStyles += 1;
-      return entry;
-    }
-    budget.text -= styled.size;
-    entry.styles = styled.styles;
-    entry.cell_styles = styled.cellStyles;
-  }
-
-  return entry;
-}
-
-/** One source for which reported side maps to which Google field, used both directions. */
-const BORDER_SIDES = [
-  ['border_top', 'borderTop'],
-  ['border_right', 'borderRight'],
-  ['border_bottom', 'borderBottom'],
-  ['border_left', 'borderLeft'],
-] as const;
-
-interface GoogleBorder {
-  color?: { color?: { rgbColor?: { red?: number; green?: number; blue?: number } } };
-  width?: { magnitude?: number; unit?: string };
-  dashStyle?: string;
-}
-
-export interface GoogleCellStyle {
-  backgroundColor?: { color?: { rgbColor?: { red?: number; green?: number; blue?: number } } };
-  borderTop?: GoogleBorder;
-  borderRight?: GoogleBorder;
-  borderBottom?: GoogleBorder;
-  borderLeft?: GoogleBorder;
-  contentAlignment?: string;
-  rowSpan?: number;
-  columnSpan?: number;
-}
-
-export interface ReportedBorder {
-  color?: string;
-  width?: number;
-  dash_style?: string;
-}
-
-export interface ReportedCellStyle {
-  background_color?: string;
-  border_top?: ReportedBorder;
-  border_right?: ReportedBorder;
-  border_bottom?: ReportedBorder;
-  border_left?: ReportedBorder;
-  content_alignment?: string;
-}
-
-/** Google omits a channel that is zero, so pure red arrives as { red: 1 }. */
-export function rgbToHex(rgbColor: { red?: number; green?: number; blue?: number } | undefined): string {
-  const channel = (v: number | undefined) =>
-    Math.round(Math.min(1, Math.max(0, v ?? 0)) * 255).toString(16).padStart(2, '0');
-  return `#${channel(rgbColor?.red)}${channel(rgbColor?.green)}${channel(rgbColor?.blue)}`.toUpperCase();
-}
-
-function describeBorder(border: GoogleBorder | undefined): ReportedBorder | undefined {
-  if (!border) return undefined;
-  const out: ReportedBorder = {};
-  const rgb = border.color?.color?.rgbColor;
-  if (rgb) out.color = rgbToHex(rgb);
-  if (border.width?.magnitude !== undefined) out.width = border.width.magnitude;
-  if (border.dashStyle) out.dash_style = border.dashStyle;
-  return Object.keys(out).length ? out : undefined;
-}
-
-/** Reports only what update_table_style can write back, so a read value can be replayed. */
-export function describeCellStyle(tableCellStyle: GoogleCellStyle | undefined): ReportedCellStyle {
-  const out: ReportedCellStyle = {};
-  const background = tableCellStyle?.backgroundColor?.color?.rgbColor;
-  if (background) out.background_color = rgbToHex(background);
-
-  for (const [side, googleSide] of BORDER_SIDES) {
-    const border = describeBorder(tableCellStyle?.[googleSide]);
-    if (border) out[side] = border;
-  }
-
-  if (tableCellStyle?.contentAlignment) out.content_alignment = tableCellStyle.contentAlignment;
-  return out;
-}
-
-export interface CollectedStyles {
-  styles: ReportedCellStyle[];
-  cellStyles: number[][];
-  size: number;
-}
-
-/**
- * Each distinct style is listed once and cells index into it. Real tables repeat
- * a handful of looks, and the index grid is what shows which ranges share one.
- */
-export function collectCellStyles(element: DocsTableElement): CollectedStyles {
-  const styles: ReportedCellStyle[] = [];
-  const seen = new Map<string, number>();
-  const cellStyles: number[][] = [];
-
-  for (const row of element.table?.tableRows ?? []) {
-    const built: number[] = [];
-    for (const c of row.tableCells ?? []) {
-      const style = describeCellStyle(c.tableCellStyle);
-      const key = JSON.stringify(style);
-      let index = seen.get(key);
-      if (index === undefined) {
-        index = styles.length;
-        seen.set(key, index);
-        styles.push(style);
-      }
-      built.push(index);
-    }
-    cellStyles.push(built);
-  }
-
-  // The index grid is part of the payload, so it is charged too.
-  return {
-    styles,
-    cellStyles,
-    size: JSON.stringify(styles).length + JSON.stringify(cellStyles).length,
-  };
-}
-
-// buildTableInsertRequests lives in docs-structure.ts, which already owned the
-// index arithmetic before tables grew a module of their own.
 
 export function normalizeTableData(rows: string[][], columns?: number): string[][] {
   if (!rows || rows.length === 0) {
@@ -379,29 +134,6 @@ export interface CellStyleArgs {
   content_alignment?: 'TOP' | 'MIDDLE' | 'BOTTOM';
 }
 
-export const borderSchema = z.object({
-  color: z.string().optional().describe('6-digit hex, e.g. #1A73E8. Defaults to #000000.'),
-  width: z.number().min(0).max(MAX_BORDER_WIDTH_PT).optional().describe('Width in points. Defaults to 1.'),
-  dash_style: z.enum(['SOLID', 'DOT', 'DASH']).optional().describe('Defaults to SOLID.'),
-});
-
-export function hexToRgbColor(hex: string, label: string) {
-  const match = /^#?([0-9a-fA-F]{6})$/.exec(String(hex));
-  if (!match) {
-    throw new Error(
-      `${label} must be a 6-digit hex colour such as #1A73E8, received '${String(hex).slice(0, 20)}'.`
-    );
-  }
-  const value = parseInt(match[1], 16);
-  return {
-    rgbColor: {
-      red: ((value >> 16) & 255) / 255,
-      green: ((value >> 8) & 255) / 255,
-      blue: (value & 255) / 255,
-    },
-  };
-}
-
 /** Google rejects a partial border, so an unset property falls back to a default here. */
 function buildBorder(side: BorderInput, label: string) {
   if (typeof side !== 'object' || Array.isArray(side)) {
@@ -417,24 +149,18 @@ function buildBorder(side: BorderInput, label: string) {
   }
   return {
     color: { color: hexToRgbColor(side.color ?? '#000000', `${label}.color`) },
-    width: { magnitude: width, unit: 'PT' },
+    width: pt(width),
     dashStyle: side.dash_style ?? 'SOLID',
   };
 }
 
-export function buildTableCellStyle(args: CellStyleArgs): { tableCellStyle: any; fields: string[] } {
-  const tableCellStyle: any = {};
-  const fields: string[] = [];
+const CELL_STYLE_FIELDS: Array<StyleField<CellStyleArgs>> = [
+  { arg: 'background_color', field: 'backgroundColor', encode: (hex) => ({ color: hexToRgbColor(hex, 'background_color') }) },
+  { arg: 'content_alignment', field: 'contentAlignment' },
+];
 
-  if (args.background_color !== undefined) {
-    tableCellStyle.backgroundColor = { color: hexToRgbColor(args.background_color, 'background_color') };
-    fields.push('backgroundColor');
-  }
-  if (args.content_alignment !== undefined) {
-    tableCellStyle.contentAlignment = args.content_alignment;
-    fields.push('contentAlignment');
-  }
-
+export function buildTableCellStyle(args: CellStyleArgs): { tableCellStyle: Record<string, unknown>; fields: string[] } {
+  const { style: tableCellStyle, fields } = buildStyle(CELL_STYLE_FIELDS, args);
   for (const [side, googleSide] of BORDER_SIDES) {
     const override = args[side];
     const border = override ?? args.border;
@@ -442,25 +168,26 @@ export function buildTableCellStyle(args: CellStyleArgs): { tableCellStyle: any;
     tableCellStyle[googleSide] = buildBorder(border, override ? side : 'border');
     fields.push(googleSide);
   }
-
+  if (fields.length === 0) {
+    const names = ['background_color', 'border', ...BORDER_SIDES.map(([side]) => side), 'content_alignment'];
+    throw new Error(`At least one style property must be provided (${names.join(', ')}).`);
+  }
   return { tableCellStyle, fields };
+}
+
+function enclosingTable(content: DocsTableElement[], index: number): DocsTableElement | undefined {
+  return content.find((c) => c.table && (c.startIndex ?? 0) <= index && index < c.endIndex);
 }
 
 /**
  * Google nests a table rather than refusing when the index lands inside one, so the
  * caller only finds out by reading the document back.
  */
-export function nestingRefusal(doc: DocsBody, index: number): string | undefined {
-  const content = doc?.body?.content ?? [];
-  const position = content.findIndex(
-    (c) => c.table && (c.startIndex ?? 0) <= index && index < c.endIndex
-  );
-  if (position === -1) {
-    return undefined;
-  }
+export function nestingRefusal(content: DocsTableElement[], index: number): string | undefined {
+  const table = enclosingTable(content, index);
+  if (!table) return undefined;
 
-  const table = content[position];
-  const before = content[position - 1]?.startIndex;
+  const before = content[content.indexOf(table) - 1]?.startIndex;
   return `index ${index} is inside the table at ${table.startIndex}-${table.endIndex}. ` +
     `Use ${table.endIndex} to place the new table after it` +
     (before !== undefined ? `, or ${before} to place it before it` : '') +
@@ -490,19 +217,11 @@ export function styleFailureWarning(located: boolean, status?: number): string {
   return `The table was created, but ${cause}${unverified}. Do not insert it again — ${recovery}.${first}`;
 }
 
-/**
- * The table that starts exactly at `tableStartIndex`, or an error that says
- * which indices would have worked. An index inside a table names a nested
- * table, which the Docs API does not expose, so no lookup can reach it.
- */
-export function locateTable(doc: DocsBody, tableStartIndex: number, tabId?: string): DocsTableElement {
-  const element = findTableStartingAt(doc, tableStartIndex);
+export function locateTable(content: DocsTableElement[], tableStartIndex: number, tabId?: string): DocsTableElement {
+  const element = findTableStartingAt(content, tableStartIndex);
   if (element) return element;
 
-  const tables = (doc?.body?.content ?? []).filter((c) => c.table);
-  const enclosing = tables.find(
-    (c) => (c.startIndex ?? 0) < tableStartIndex && tableStartIndex < c.endIndex
-  );
+  const enclosing = enclosingTable(content, tableStartIndex);
   if (enclosing) {
     throw new Error(
       `Index ${tableStartIndex} is inside the table at ${enclosing.startIndex}-${enclosing.endIndex}, ` +
@@ -510,7 +229,7 @@ export function locateTable(doc: DocsBody, tableStartIndex: number, tabId?: stri
       `Use the outer table at ${enclosing.startIndex} instead.`
     );
   }
-  const starts = tables.map((c) => c.startIndex);
+  const starts = content.filter((c) => c.table).map((c) => c.startIndex);
   const listed = starts.slice(0, 20).join(', ');
   const rest = starts.length > 20 ? ` and ${starts.length - 20} more` : '';
   throw new Error(
@@ -520,28 +239,6 @@ export function locateTable(doc: DocsBody, tableStartIndex: number, tabId?: stri
   );
 }
 
-export interface TableShape {
-  rows: number;
-  columns: number;
-}
-
-export const tableShape = (element: DocsTableElement): TableShape => ({
-  rows: element.table?.rows ?? 0,
-  columns: element.table?.columns ?? 0,
-});
-
-export interface CellRange {
-  rowIndex: number;
-  columnIndex: number;
-  rowSpan: number;
-  columnSpan: number;
-}
-
-/**
- * A zero-based cell range checked against the table's shape. Spans default to
- * the rest of the table. The start is checked before the default span is
- * derived from it, or the span would go negative and the range read backwards.
- */
 export function validateCellRange(
   shape: TableShape,
   tableStartIndex: number,
@@ -590,6 +287,7 @@ export interface TableModificationArgs {
   position?: 'before' | 'after';
   width_pt?: number;
   pinned_rows?: number;
+  suggest?: boolean;
 }
 
 export interface TableModification {
@@ -598,13 +296,16 @@ export interface TableModification {
   message: string;
 }
 
-/**
- * One Docs request for a structural change to a table whose shape is known,
- * with the shape it leaves behind. Everything is validated here so the tool
- * never sends Google a request it would reject with a bare 400.
- */
+function mergedExtent(merges: CellRange[], cell: CellRange, axis: 'row' | 'column'): { first: number; count: number } {
+  const merge = merges.find((m) =>
+    cell.rowIndex >= m.rowIndex && cell.rowIndex < m.rowIndex + m.rowSpan &&
+    cell.columnIndex >= m.columnIndex && cell.columnIndex < m.columnIndex + m.columnSpan);
+  if (axis === 'row') return merge ? { first: merge.rowIndex, count: merge.rowSpan } : { first: cell.rowIndex, count: 1 };
+  return merge ? { first: merge.columnIndex, count: merge.columnSpan } : { first: cell.columnIndex, count: 1 };
+}
+
 export function buildTableModification(
-  shape: TableShape,
+  shape: TableLayout,
   tableStartLocation: { index: number; tabId?: string },
   args: TableModificationArgs,
 ): TableModification {
@@ -616,49 +317,53 @@ export function buildTableModification(
     columnIndex: range.columnIndex,
   });
   const after = args.position !== 'before';
+  const extent = (cell: CellRange, axis: 'row' | 'column') => {
+    const { first, count } = mergedExtent(shape.merges, cell, axis);
+    const lines = count === 1 ? `${axis} ${first}` : `${axis}s ${first}-${first + count - 1}`;
+    return { first, count, lines, merged: count === 1 ? '' : `, which the merged cell at row ${cell.rowIndex}, column ${cell.columnIndex} spans` };
+  };
 
   switch (action) {
-    case 'insert_row': {
-      const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
-      return {
-        request: { insertTableRow: { tableCellLocation: cellLocation(cell), insertBelow: after } },
-        shape: { rows: shape.rows + 1, columns: shape.columns },
-        message: `Inserted a row ${after ? 'below' : 'above'} row ${cell.rowIndex}`,
-      };
-    }
+    case 'insert_row':
     case 'insert_column': {
+      const axis = action === 'insert_row' ? 'row' : 'column';
       const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
+      const { first, count, lines, merged } = extent(cell, axis);
+      const side = axis === 'row' ? (after ? 'below' : 'above') : (after ? 'right of' : 'left of');
       return {
-        request: { insertTableColumn: { tableCellLocation: cellLocation(cell), insertRight: after } },
-        shape: { rows: shape.rows, columns: shape.columns + 1 },
-        message: `Inserted a column ${after ? 'right of' : 'left of'} column ${cell.columnIndex}`,
+        request: axis === 'row'
+          ? { insertTableRow: { tableCellLocation: cellLocation(cell), insertBelow: after } }
+          : { insertTableColumn: { tableCellLocation: cellLocation(cell), insertRight: after } },
+        shape: axis === 'row'
+          ? { rows: shape.rows + 1, columns: shape.columns }
+          : { rows: shape.rows, columns: shape.columns + 1 },
+        message: `Inserted a ${axis} ${side} ${lines}${merged}; the new ${axis} is ${axis} ${after ? first + count : first}`,
       };
     }
-    case 'delete_row': {
-      if (shape.rows <= 1) {
-        throw new Error('This table has a single row; deleting the last row deletes the table. Use delete_content over the table\'s range for that.');
-      }
-      const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
-      return {
-        request: { deleteTableRow: { tableCellLocation: cellLocation(cell) } },
-        shape: { rows: shape.rows - 1, columns: shape.columns },
-        message: `Deleted row ${cell.rowIndex}`,
-      };
-    }
+    case 'delete_row':
     case 'delete_column': {
-      if (shape.columns <= 1) {
-        throw new Error('This table has a single column; deleting the last column deletes the table. Use delete_content over the table\'s range for that.');
+      const axis = action === 'delete_row' ? 'row' : 'column';
+      const total = axis === 'row' ? shape.rows : shape.columns;
+      if (total <= 1) {
+        throw new Error(`This table has a single ${axis}; deleting the last ${axis} deletes the table. Use delete_content over the table's range for that.`);
       }
       const cell = validateCellRange(shape, tableStartIndex, { ...args, row_span: 1, column_span: 1 });
+      const { count, lines, merged } = extent(cell, axis);
+      if (count >= total) {
+        throw new Error(`The cell at row ${cell.rowIndex}, column ${cell.columnIndex} is merged across ${lines}, which Google deletes together, and that is the whole table. Unmerge it first, or use delete_content over the table's range to delete the table.`);
+      }
       return {
-        request: { deleteTableColumn: { tableCellLocation: cellLocation(cell) } },
-        shape: { rows: shape.rows, columns: shape.columns - 1 },
-        message: `Deleted column ${cell.columnIndex}`,
+        request: axis === 'row'
+          ? { deleteTableRow: { tableCellLocation: cellLocation(cell) } }
+          : { deleteTableColumn: { tableCellLocation: cellLocation(cell) } },
+        shape: axis === 'row'
+          ? { rows: shape.rows - count, columns: shape.columns }
+          : { rows: shape.rows, columns: shape.columns - count },
+        message: `Deleted ${lines}${merged}`,
       };
     }
     case 'merge_cells':
     case 'unmerge_cells': {
-      // A merge changes the table, so its extent is never implied; an unmerge is harmless
       const spans = action === 'merge_cells' ? { row_span: args.row_span ?? 1, column_span: args.column_span ?? 1 } : {};
       const range = validateCellRange(shape, tableStartIndex, { ...args, ...spans });
       if (action === 'merge_cells' && range.rowSpan * range.columnSpan < 2) {
@@ -673,6 +378,9 @@ export function buildTableModification(
       };
     }
     case 'set_column_width': {
+      if (args.suggest) {
+        throw new Error('Google does not take column widths as a suggestion: call set_column_width without suggest.');
+      }
       const width = args.width_pt;
       if (width === undefined || !Number.isFinite(width) || width < MIN_COLUMN_WIDTH_PT || width > MAX_COLUMN_WIDTH_PT) {
         throw new Error(`set_column_width needs width_pt between ${MIN_COLUMN_WIDTH_PT} and ${MAX_COLUMN_WIDTH_PT} points.`);
@@ -687,7 +395,7 @@ export function buildTableModification(
           updateTableColumnProperties: {
             tableStartLocation,
             ...(columnIndices ? { columnIndices } : {}),
-            tableColumnProperties: { widthType: 'FIXED_WIDTH', width: { magnitude: width, unit: 'PT' } },
+            tableColumnProperties: { widthType: 'FIXED_WIDTH', width: pt(width) },
             fields: 'widthType,width',
           },
         },
@@ -700,8 +408,8 @@ export function buildTableModification(
       if (pinned === undefined || !Number.isInteger(pinned) || pinned < 0) {
         throw new Error('pin_header_rows needs pinned_rows: how many top rows repeat on each page, 0 to unpin.');
       }
-      if (pinned >= shape.rows) {
-        throw new Error(`pinned_rows must leave at least one unpinned row; this table has ${shape.rows} row(s).`);
+      if (pinned > shape.rows) {
+        throw new Error(`pinned_rows is ${pinned}, but this table has only ${shape.rows} row(s).`);
       }
       return {
         request: { pinTableHeaderRows: { tableStartLocation, pinnedHeaderRowsCount: pinned } },

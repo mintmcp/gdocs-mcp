@@ -1,6 +1,12 @@
 import { readFileSync } from 'node:fs';
 import { zipSync, strToU8 } from 'fflate';
 
+export const paragraph = (text: string, startIndex: number, extra: Record<string, unknown> = {}) => ({
+  startIndex,
+  endIndex: startIndex + text.length,
+  paragraph: { elements: [{ startIndex, endIndex: startIndex + text.length, textRun: { content: text } }], ...extra },
+});
+
 /** Loads a checked-in Word fixture as the bytes extractWordText receives. */
 export const fixture = (name: string) =>
   new Uint8Array(readFileSync(new URL(`./${name}`, import.meta.url)));

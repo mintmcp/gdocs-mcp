@@ -1,27 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { createServer } from "./server.js";
-import { requestContext } from "./auth.js";
+import { buildDocx } from "./lib/__fixtures__/index.js";
 import { jsonResponse, stubFetch } from "./lib/labelStubs.js";
+import { batchBody, callTool, DOC_METADATA, stubDoc } from "./lib/mcpHarness.js";
 
 const DOC = {
   revisionId: "rev-1",
   body: { content: [{ startIndex: 0, endIndex: 1, sectionBreak: {} }, { startIndex: 1, endIndex: 7, paragraph: { elements: [{ startIndex: 1, endIndex: 7, textRun: { content: "Title\n" } }], paragraphStyle: { namedStyleType: "HEADING_1" } } }] },
 };
-
-const DOC_METADATA = { name: "Doc", mimeType: "application/vnd.google-apps.document", webViewLink: "https://docs.google.com/document/d/doc1" };
-
-async function callTool(name: string, args: Record<string, unknown>) {
-  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-  const client = new Client({ name: "test", version: "0.0.0" });
-  await createServer(null).connect(serverTransport);
-  await client.connect(clientTransport);
-  vi.spyOn(process.stdout, "write").mockImplementation(() => true);
-  return requestContext.run({ accessToken: "tok" } as any, () =>
-    client.callTool({ name, arguments: { document_id: "doc1", ...args } }),
-  );
-}
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -82,37 +67,44 @@ describe("get_document format", () => {
 });
 
 describe("append_text", () => {
-  function stubAppend() {
-    return stubFetch([
-      ["/drive/v3/files/doc1?", () => jsonResponse(DOC_METADATA)],
-      [":batchUpdate", () => jsonResponse({})],
-      ["docs.googleapis.com/v1/documents/doc1", () => jsonResponse(DOC)],
-    ]);
-  }
-
-  function batchRequests(calls: Array<{ url: string; init?: RequestInit }>) {
-    const updates = calls.filter(({ url }) => url.endsWith(":batchUpdate"));
-    expect(updates).toHaveLength(1);
-    return JSON.parse(String(updates[0].init?.body)).requests;
-  }
-
   it("starts a new paragraph and resets the style it inherited from a heading", async () => {
-    const calls = stubAppend();
+    const calls = stubDoc(DOC);
     const result = await callTool("append_text", { text: "Body" });
     expect(result.isError).toBeFalsy();
-    const [insert, chars, style, bullets] = batchRequests(calls);
+    const [insert, chars, bullets, style] = batchBody(calls).requests;
     expect(insert).toEqual({ insertText: { location: { index: 6 }, text: "\nBody" } });
-    expect(chars.updateTextStyle.range).toEqual({ startIndex: 6, endIndex: 11 });
-    expect(style.updateParagraphStyle.range).toEqual({ startIndex: 7, endIndex: 11 });
+    expect(chars.updateTextStyle.range).toEqual({ startIndex: 7, endIndex: 11 });
     expect(bullets.deleteParagraphBullets.range).toEqual({ startIndex: 7, endIndex: 11 });
+    expect(style.updateParagraphStyle).toEqual({
+      range: { startIndex: 7, endIndex: 11 },
+      paragraphStyle: { namedStyleType: "NORMAL_TEXT" },
+      fields: "namedStyleType,alignment,lineSpacing,spaceAbove,spaceBelow,indentStart,indentEnd,indentFirstLine,keepWithNext,pageBreakBefore",
+    });
   });
 
   it("keeps the heading when the text brings its own leading newline", async () => {
-    const calls = stubAppend();
+    const calls = stubDoc(DOC);
     await callTool("append_text", { text: "\nBody" });
-    const [insert, , style, bullets] = batchRequests(calls);
+    const [insert, chars, bullets, style] = batchBody(calls).requests;
     expect(insert).toEqual({ insertText: { location: { index: 6 }, text: "\nBody" } });
-    expect(style.updateParagraphStyle.range).toEqual({ startIndex: 7, endIndex: 11 });
-    expect(bullets.deleteParagraphBullets.range).toEqual({ startIndex: 7, endIndex: 11 });
+    for (const request of [chars.updateTextStyle, bullets.deleteParagraphBullets, style.updateParagraphStyle]) {
+      expect(request.range).toEqual({ startIndex: 7, endIndex: 11 });
+    }
   });
 });
+
+describe("get_document on a Word upload", () => {
+  it("reads the text and notes what does not apply, instead of refusing options meant for Google Docs", async () => {
+    const docx = buildDocx(["Hello Word"]);
+    stubFetch([
+      ["?alt=media", () => new Response(docx, { status: 200 })],
+      ["/drive/v3/files/doc1?", () => jsonResponse({ name: "Report.docx", mimeType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document", size: String(docx.byteLength) })],
+    ]);
+    const result = await callTool("get_document", { format: "markdown", tab_id: "t.0", suggestions_view_mode: "SUGGESTIONS_INLINE" });
+    expect(result.isError).toBeFalsy();
+    const output = result.structuredContent as any;
+    expect(output.content).toContain("Hello Word");
+    expect(output.message).toMatch(/Word upload.*suggestions and markdown are unavailable/);
+  });
+});
+

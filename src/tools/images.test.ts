@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { batchBody, callTool, errorText, paragraph, stubDoc } from "../lib/mcpHarness.js";
+import { batchBody, callTool, DOC_METADATA, errorText, paragraph, stubDoc, stubRefusal } from "../lib/mcpHarness.js";
+import { jsonResponse, stubFetch } from "../lib/labelStubs.js";
 
 const DOC = {
   revisionId: "rev-1",
@@ -54,13 +55,7 @@ describe("insert_image", () => {
   });
 
   it("explains a Google refusal to fetch the image", async () => {
-    stubDoc(DOC, { error: { code: 400, status: "INVALID_ARGUMENT", message: "Invalid requests[0].insertInlineImage: The provided image is in an unsupported format." } });
-    vi.stubGlobal("fetch", vi.fn(async (input: any) => {
-      const url = String(input);
-      if (url.endsWith(":batchUpdate")) return new Response(JSON.stringify({ error: { code: 400, status: "INVALID_ARGUMENT", message: "The provided image is in an unsupported format." } }), { status: 400, headers: { "Content-Type": "application/json" } });
-      if (url.includes("/drive/v3/files/doc1?")) return new Response(JSON.stringify({ name: "Doc", mimeType: "application/vnd.google-apps.document" }), { status: 200, headers: { "Content-Type": "application/json" } });
-      return new Response(JSON.stringify(DOC), { status: 200, headers: { "Content-Type": "application/json" } });
-    }));
+    stubRefusal(DOC, "The provided image is in an unsupported format.");
     const text = errorText(await callTool("insert_image", { image_url: "https://example.com/a.png", index: 1 }));
     expect(text).toMatch(/unsupported format/);
     expect(text).toMatch(/PNG, JPEG or GIF/);
@@ -96,5 +91,50 @@ describe("replace_image tab resolution", () => {
     const result = await callTool("replace_image", { object_id: "kix.img2", image_url: "https://example.com/b.jpg" });
     expect(result.isError).toBeFalsy();
     expect(batchBody(calls).requests[0].replaceImage.tabId).toBe("t.1");
+  });
+});
+
+describe("image refusals", () => {
+  it("adds the image limits only when Google blamed the image, not the index", async () => {
+    stubRefusal(DOC, "Invalid requests[0].insertInlineImage: Index 900 must be less than the end index of the referenced segment, 7.");
+    const text = errorText(await callTool("insert_image", { image_url: "https://example.com/a.png", index: 900 }));
+    expect(text).toMatch(/Index 900/);
+    expect(text).not.toMatch(/PNG, JPEG or GIF/);
+  });
+
+  it("adds them when Google could not find the image", async () => {
+    stubRefusal(DOC, "Invalid requests[0].insertInlineImage: The provided image was not found.");
+    expect(errorText(await callTool("insert_image", { image_url: "https://example.com/a.png", index: 1 }))).toMatch(/not found\. Google fetches the image itself/);
+  });
+});
+
+describe("get_document_images", () => {
+  const image = (uri: string, title?: string) => ({
+    inlineObjectProperties: { embeddedObject: { ...(title ? { title } : {}), imageProperties: { contentUri: uri } } },
+  });
+
+  it("returns every image in document order, with a line for one that could not be fetched", async () => {
+    stubFetch([
+      ["https://images.example.com/a.png", () => new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { "Content-Type": "image/png" } })],
+      ["https://images.example.com/b.png", () => new Response("", { status: 404 })],
+      ["https://images.example.com/c.gif", () => new Response(new Uint8Array([255]), { status: 200, headers: { "Content-Type": "image/gif" } })],
+      ["/drive/v3/files/doc1?", () => jsonResponse(DOC_METADATA)],
+      ["docs.googleapis.com/v1/documents/doc1", () => jsonResponse({
+        ...DOC,
+        inlineObjects: {
+          "kix.a": image("https://images.example.com/a.png", "Chart"),
+          "kix.b": image("https://images.example.com/b.png"),
+          "kix.c": image("https://images.example.com/c.gif"),
+        },
+      })],
+    ]);
+    const result = await callTool("get_document_images", {});
+    expect(result.isError).toBeFalsy();
+    expect(result.content).toEqual([
+      { type: "text", text: "Image: Chart" },
+      { type: "image", data: "AQID", mimeType: "image/png" },
+      { type: "text", text: "Failed to fetch image 'kix.b' (status 404)." },
+      { type: "image", data: "/w==", mimeType: "image/gif" },
+    ]);
   });
 });

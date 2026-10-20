@@ -4,8 +4,8 @@ import { buildDocumentStyle } from './documentStyle.js';
 const LETTER = { width: { magnitude: 612 }, height: { magnitude: 792 } };
 
 describe('buildDocumentStyle', () => {
-  it('builds nothing from no arguments', () => {
-    expect(buildDocumentStyle({}, LETTER)).toEqual({ documentStyle: {}, fields: [] });
+  it('refuses a call that sets nothing, naming every property', () => {
+    expect(() => buildDocumentStyle({}, LETTER)).toThrow(/margin_top_pt.*page_number_start, page_size, orientation/);
   });
 
   it('rotates a named size for landscape and leaves portrait alone', () => {

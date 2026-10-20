@@ -1,10 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { batchBody, callTool, errorText, paragraph, stubDoc } from "../lib/mcpHarness.js";
+import { batchBody, callTool, errorText, stubDoc, TITLE_DOC } from "../lib/mcpHarness.js";
 
-const DOC = {
-  revisionId: "rev-1",
-  body: { content: [{ startIndex: 0, endIndex: 1, sectionBreak: {} }, paragraph("Title\n", 1)] },
-};
+const DOC = TITLE_DOC;
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -71,7 +68,7 @@ describe("update_paragraph_style extras", () => {
     await callTool("update_paragraph_style", { startIndex: 1, endIndex: 6, list_style: "bullet", bullet_preset: "BULLET_ARROW_DIAMOND_DISC" });
     expect(batchBody(calls).requests[0].createParagraphBullets.bulletPreset).toBe("BULLET_ARROW_DIAMOND_DISC");
     stubDoc(DOC);
-    expect(errorText(await callTool("update_paragraph_style", { startIndex: 1, endIndex: 6, bullet_preset: "BULLET_ARROW_DIAMOND_DISC" }))).toMatch(/bullet_preset needs list_style/);
+    expect(errorText(await callTool("update_paragraph_style", { startIndex: 1, endIndex: 6, bullet_preset: "BULLET_ARROW_DIAMOND_DISC" }))).toMatch(/goes with list_style "bullet"/);
   });
 });
 

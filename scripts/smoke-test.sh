@@ -6,7 +6,7 @@
 #
 #   1. GET  /healthz                     -> 200 with status=ok
 #   2. POST /mcp initialize              -> returns protocolVersion
-#   3. POST /mcp tools/list              -> returns the expected tool count (25)
+#   3. POST /mcp tools/list              -> returns the expected tool count (24)
 #   4. POST /mcp tools/call search_documents -> returns a structured 401 (fake token,
 #                                               no crash) instead of an internal error
 #
@@ -17,7 +17,7 @@ set -euo pipefail
 
 IMAGE_TAG="gdocs-mcp:smoke-$$"
 CONTAINER_NAME="gdocs-mcp-smoke-$$"
-EXPECTED_TOOLS=25
+EXPECTED_TOOLS=24
 
 # Pick a free local port unless one was forced via SMOKE_PORT. We probe with a
 # short-lived Python listen on :0 so the port is genuinely available right

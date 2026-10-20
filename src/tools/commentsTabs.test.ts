@@ -1,10 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { batchBody, callTool, errorText, paragraph, stubDoc } from "../lib/mcpHarness.js";
+import { batchBody, callTool, errorText, paragraph, stubDoc, TITLE_DOC } from "../lib/mcpHarness.js";
 
-const DOC = {
-  revisionId: "rev-1",
-  body: { content: [{ startIndex: 0, endIndex: 1, sectionBreak: {} }, paragraph("Title\n", 1)] },
-};
+const DOC = TITLE_DOC;
 
 const TABBED = {
   revisionId: "rev-1",
@@ -54,6 +51,23 @@ describe("add_comment", () => {
     stubDoc(DOC);
     expect(errorText(await callTool("add_comment", { content: "x", thread_id: "AAAC1", startIndex: 1, endIndex: 2 }))).toMatch(/thread_id/);
   });
+
+  it("reports an unsaved comment as a plain failure, since nothing else changed", async () => {
+    stubDoc(DOC, { replies: [{}], commentUpdateState: "ALL_FAILED_UNKNOWN_REASON" });
+    const result = await callTool("add_comment", { content: "x", startIndex: 1, endIndex: 5 });
+    const payload = JSON.parse((result.content as any)[0].text);
+    expect(result.isError).toBe(true);
+    expect(payload.error).toMatch(/saved none of the comments/);
+    expect(payload).not.toHaveProperty("partialSuccess");
+  });
+
+  it("measures the 2048 limit in UTF-8 bytes, as Google does", async () => {
+    const calls = stubDoc(DOC);
+    expect(errorText(await callTool("add_comment", { content: "😀".repeat(600), thread_id: "AAAC1" }))).toMatch(/2400 bytes/);
+    expect(calls.filter(({ url }) => url.endsWith(":batchUpdate"))).toHaveLength(0);
+    stubDoc(DOC, { replies: [{}] });
+    expect((await callTool("add_comment", { content: "é".repeat(1024), thread_id: "AAAC1" })).isError).toBeFalsy();
+  });
 });
 
 describe("manage_tab", () => {
@@ -70,6 +84,7 @@ describe("manage_tab", () => {
     const result = await callTool("manage_tab", { action: "rename", tab_id: "t.1", title: "Renamed" });
     expect(result.isError).toBeFalsy();
     expect(batchBody(calls).requests).toEqual([{ updateDocumentTabProperties: { tabProperties: { tabId: "t.1", title: "Renamed" }, fields: "title" } }]);
+    expect((result.structuredContent as any).tab).toEqual({ tabId: "t.1", title: "Renamed", index: 1, nestingLevel: 0 });
   });
 
   it("deletes a tab, but never the last one", async () => {
@@ -107,5 +122,32 @@ describe("manage_tab nested tabs", () => {
     const result = await callTool("manage_tab", { action: "delete", tab_id: "t.child" });
     expect(result.isError).toBeFalsy();
     expect(batchBody(calls).requests).toEqual([{ deleteTab: { tabId: "t.child" } }]);
+  });
+});
+
+describe("argument checks before any network call", () => {
+  it("refuses a reply that names a tab, and a rename without a title", async () => {
+    const calls = stubDoc(TABBED);
+    expect(errorText(await callTool("add_comment", { content: "x", thread_id: "AAAC1", tab_id: "t.1" }))).toMatch(/tab_id/);
+    expect(errorText(await callTool("manage_tab", { action: "rename", tab_id: "t.1" }))).toMatch(/title/);
+    expect(calls.filter(({ url }) => url.includes("docs.googleapis.com"))).toHaveLength(0);
+  });
+});
+
+describe("get_document on one tab", () => {
+  it("returns a table's full text in content, past the cap structure puts on a cell", async () => {
+    const long = "x".repeat(500);
+    stubDoc({
+      revisionId: "rev-1",
+      tabs: [{
+        tabProperties: { tabId: "t.0", title: "Only", index: 0 },
+        documentTab: { body: { content: [
+          { startIndex: 1, endIndex: 600, table: { rows: 1, columns: 1, tableRows: [{ tableCells: [{ content: [paragraph(`${long}\n`, 2)] }] }] } },
+        ] } },
+      }],
+    });
+    const output = (await callTool("get_document", { tab_id: "t.0", include_structure: true })).structuredContent as any;
+    expect(output.content).toBe(`${long}\n`);
+    expect(output.structure[0].cells[0][0]).toMatch(/\.\.\.$/);
   });
 });
