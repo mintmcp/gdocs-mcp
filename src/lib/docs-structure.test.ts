@@ -1,19 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  buildTableInsertRequests,
-  buildWriteControl,
-  clearInheritedFormattingRequest,
   escapeDriveQueryName,
-  extractHeadings,
-  findLetterByContent,
-  namedStyleToHeadingLevel,
-  normalizeForMatch,
-  parseDocumentStructure,
-  parseExportArtifacts,
-  summarizeTabs,
-  validateIndexRange,
-  validateInsertIndex,
+  headingsOf,
   isGoogleServedUrl,
+  namedStyleToHeadingLevel,
+  parseDocumentStructure,
 } from './docs-structure.js';
 
 /**
@@ -54,7 +45,9 @@ describe('namedStyleToHeadingLevel', () => {
   });
 });
 
-describe('extractHeadings', () => {
+describe('headingsOf', () => {
+  const extractHeadings = (content: any[]) => headingsOf(parseDocumentStructure(content).elements);
+
   it('returns headings in document order with level/text/indices', () => {
     const content = [
       paragraph('Title\n', { startIndex: 1, endIndex: 7, namedStyleType: 'HEADING_1' }),
@@ -162,77 +155,6 @@ describe('parseDocumentStructure', () => {
   });
 });
 
-describe('clearInheritedFormattingRequest', () => {
-  it('builds an updateTextStyle that clears the exact set of inheritable fields', () => {
-    const req = clearInheritedFormattingRequest(5, 10);
-    expect(req).toEqual({
-      updateTextStyle: {
-        range: { startIndex: 5, endIndex: 10 },
-        textStyle: {},
-        fields: 'bold,italic,underline,strikethrough,link',
-      },
-    });
-  });
-
-  it('passes through indices as given (no clamping)', () => {
-    const req = clearInheritedFormattingRequest(0, 1);
-    expect(req.updateTextStyle.range).toEqual({ startIndex: 0, endIndex: 1 });
-  });
-});
-
-describe('buildTableInsertRequests', () => {
-  it('returns an empty array for empty input', () => {
-    expect(buildTableInsertRequests([], 10)).toEqual([]);
-    expect(buildTableInsertRequests([[]], 10)).toEqual([]);
-  });
-
-  it('emits requests in REVERSE document order so earlier inserts do not shift later indices', () => {
-    // 2 rows x 2 cols, all cells filled.
-    const requests = buildTableInsertRequests([['A', 'B'], ['C', 'D']], 1);
-    // Strictly descending insertText.location.index.
-    const indices = requests.map((r) => r.insertText.location.index);
-    const sortedDesc = [...indices].sort((a, b) => b - a);
-    expect(indices).toEqual(sortedDesc);
-    expect(requests).toHaveLength(4);
-  });
-
-  it('computes per-cell indices with the documented row+col formula', () => {
-    // tableInsertIndex=10, 1 row x 2 cols.
-    // rowIndex = 3 + 0 * 2 * 2 + 0 = 3
-    // col 0 -> 3 + 0*2 + 1 + 10 = 14
-    // col 1 -> 3 + 1*2 + 1 + 10 = 16
-    const requests = buildTableInsertRequests([['X', 'Y']], 10);
-    // Reverse order: Y first, then X.
-    expect(requests[0]).toEqual({ insertText: { text: 'Y', location: { index: 16 } } });
-    expect(requests[1]).toEqual({ insertText: { text: 'X', location: { index: 14 } } });
-  });
-
-  it('skips empty cells so no insertText is emitted for them', () => {
-    const requests = buildTableInsertRequests([['A', '', 'B']], 1);
-    const texts = requests.map((r) => r.insertText.text);
-    expect(texts).toContain('A');
-    expect(texts).toContain('B');
-    expect(texts).not.toContain('');
-    expect(requests).toHaveLength(2);
-  });
-
-  it('coerces non-string cell values via String(...)', () => {
-    // Cells *should* be strings, but defend in depth.
-    const requests = buildTableInsertRequests([[42 as any, true as any]], 1);
-    const texts = requests.map((r) => r.insertText.text);
-    expect(texts).toContain('42');
-    expect(texts).toContain('true');
-  });
-
-  it('handles a single-cell table', () => {
-    const requests = buildTableInsertRequests([['only']], 5);
-    expect(requests).toHaveLength(1);
-    expect(requests[0].insertText.text).toBe('only');
-    // rowIndex=3, col=0 -> 3 + 0 + 1 + 5 = 9
-    expect(requests[0].insertText.location.index).toBe(9);
-  });
-});
-
 describe('escapeDriveQueryName', () => {
   it('returns undefined for empty / undefined input', () => {
     expect(escapeDriveQueryName(undefined)).toBeUndefined();
@@ -258,146 +180,6 @@ describe('escapeDriveQueryName', () => {
   });
 });
 
-describe('buildWriteControl', () => {
-  it('returns undefined for missing / non-string revisionId', () => {
-    expect(buildWriteControl(undefined)).toBeUndefined();
-    expect(buildWriteControl('')).toBeUndefined();
-    expect(buildWriteControl(123 as any)).toBeUndefined();
-  });
-
-  it('wraps a string revisionId into the Docs writeControl shape', () => {
-    expect(buildWriteControl('rev-abc')).toEqual({ requiredRevisionId: 'rev-abc' });
-  });
-});
-
-describe('validateIndexRange', () => {
-  it('accepts a valid range', () => {
-    expect(() => validateIndexRange(0, 1)).not.toThrow();
-    expect(() => validateIndexRange(5, 10)).not.toThrow();
-  });
-
-  it('rejects negative startIndex', () => {
-    expect(() => validateIndexRange(-1, 5)).toThrow(/startIndex/);
-  });
-
-  it('rejects endIndex <= startIndex', () => {
-    expect(() => validateIndexRange(5, 5)).toThrow(/endIndex/);
-    expect(() => validateIndexRange(5, 4)).toThrow(/endIndex/);
-  });
-
-  it('rejects non-finite values', () => {
-    expect(() => validateIndexRange(NaN, 5)).toThrow();
-    expect(() => validateIndexRange(0, Infinity)).toThrow();
-  });
-});
-
-describe('validateInsertIndex', () => {
-  it('accepts an index >= 1', () => {
-    expect(() => validateInsertIndex(1)).not.toThrow();
-    expect(() => validateInsertIndex(42)).not.toThrow();
-  });
-
-  it('rejects an index < 1 (the document-start sentinel)', () => {
-    expect(() => validateInsertIndex(0)).toThrow(/Docs body starts at index 1/);
-    expect(() => validateInsertIndex(-5)).toThrow();
-  });
-
-  it('rejects non-finite values', () => {
-    expect(() => validateInsertIndex(NaN)).toThrow();
-  });
-});
-
-describe('summarizeTabs', () => {
-  it('returns an empty array for missing / empty tabs', () => {
-    expect(summarizeTabs(undefined)).toEqual([]);
-    expect(summarizeTabs([])).toEqual([]);
-  });
-
-  it('flattens nested childTabs in pre-order with depth-derived nestingLevel fallback', () => {
-    const tabs = [
-      {
-        tabProperties: { tabId: 'root', title: 'Root', index: 0 },
-        childTabs: [
-          { tabProperties: { tabId: 'child', title: 'Child', index: 0 } },
-        ],
-      },
-      { tabProperties: { tabId: 'sibling', title: 'Sibling', index: 1, nestingLevel: 0 } },
-    ];
-    const out = summarizeTabs(tabs);
-    expect(out.map((t) => t.tabId)).toEqual(['root', 'child', 'sibling']);
-    // root: no provided nestingLevel -> falls back to depth (0).
-    expect(out[0].nestingLevel).toBe(0);
-    // child: no provided nestingLevel -> falls back to depth (1).
-    expect(out[1].nestingLevel).toBe(1);
-    // sibling: explicit nestingLevel preserved.
-    expect(out[2].nestingLevel).toBe(0);
-  });
-
-  it('skips tabs without a tabId', () => {
-    const tabs = [
-      { tabProperties: { title: 'No id' } },
-      { tabProperties: { tabId: 'has-id' } },
-    ];
-    expect(summarizeTabs(tabs).map((t) => t.tabId)).toEqual(['has-id']);
-  });
-});
-
-describe('parseExportArtifacts', () => {
-  it('returns the input unchanged when there is no trailing letter block', () => {
-    const parsed = parseExportArtifacts('Just a plain doc.\nNo markers.');
-    expect(parsed.body).toBe('Just a plain doc.\nNo markers.');
-    expect(parsed.letterContent.size).toBe(0);
-    expect(parsed.letterReactions.size).toBe(0);
-    expect(parsed.commentLetters.size).toBe(0);
-  });
-
-  it('strips the trailing letter block and captures comment text + reactions', () => {
-    const text = [
-      'Body paragraph one.',
-      'Body paragraph two with [a] marker.',
-      '',
-      '[a]First comment',
-      'Alice reacted with 👍 at 2024-01-02 14:30',
-      'Bob reacted with 🎉 at 2024-01-02 15:00 PM',
-      '[b]Second comment text',
-    ].join('\n');
-    const parsed = parseExportArtifacts(text);
-    expect(parsed.body).toBe('Body paragraph one.\nBody paragraph two with [a] marker.');
-    expect(parsed.letterContent.get('a')).toBe('First comment');
-    expect(parsed.letterContent.get('b')).toBe('Second comment text');
-    expect(parsed.commentLetters).toEqual(new Set(['a', 'b']));
-    const rx = parsed.letterReactions.get('a')!;
-    expect(rx).toHaveLength(2);
-    expect(rx[0]).toEqual({ author_name: 'Alice', emoji: '👍', timestamp: '2024-01-02T14:30' });
-    // AM/PM suffix dropped; HH is already 24h.
-    expect(rx[1]).toEqual({ author_name: 'Bob', emoji: '🎉', timestamp: '2024-01-02T15:00' });
-    expect(parsed.letterReactions.get('b')).toEqual([]);
-  });
-});
-
-describe('normalizeForMatch', () => {
-  it('collapses runs of whitespace and trims', () => {
-    expect(normalizeForMatch('  a   b\n\tc  ')).toBe('a b c');
-  });
-});
-
-describe('findLetterByContent', () => {
-  it('finds the letter whose normalised content matches', () => {
-    const map = new Map([
-      ['a', 'Hello world'],
-      ['b', '  Goodbye  world  '],
-    ]);
-    expect(findLetterByContent(map, 'Hello\tworld')).toBe('a');
-    expect(findLetterByContent(map, 'Goodbye world')).toBe('b');
-  });
-
-  it('returns undefined for empty / no-match input', () => {
-    const map = new Map([['a', 'Hello']]);
-    expect(findLetterByContent(map, '')).toBeUndefined();
-    expect(findLetterByContent(map, 'nope')).toBeUndefined();
-  });
-});
-
 describe('isGoogleServedUrl', () => {
   it('allows Google-served image and API hosts', () => {
     expect(isGoogleServedUrl('https://lh7-us.googleusercontent.com/docsz/abc')).toBe(true);
@@ -411,5 +193,50 @@ describe('isGoogleServedUrl', () => {
     expect(isGoogleServedUrl('https://googleusercontent.com.evil.example/x')).toBe(false);
     expect(isGoogleServedUrl('http://lh7-us.googleusercontent.com/x')).toBe(false);
     expect(isGoogleServedUrl('not a url')).toBe(false);
+  });
+});
+
+describe('parseDocumentStructure list items', () => {
+  it('reports the bullet nesting level on list paragraphs only', () => {
+    const content = [
+      paragraph('plain\n'),
+      { ...paragraph('item\n', { startIndex: 7 }), paragraph: { ...paragraph('item\n').paragraph, bullet: { listId: 'kix.1' } } },
+      { ...paragraph('nested\n', { startIndex: 12 }), paragraph: { ...paragraph('nested\n').paragraph, bullet: { listId: 'kix.1', nestingLevel: 1 } } },
+    ];
+    const { elements } = parseDocumentStructure(content);
+    expect(elements[0].bullet).toBeUndefined();
+    expect(elements[1].bullet).toEqual({ nestingLevel: 0 });
+    expect(elements[2].bullet).toEqual({ nestingLevel: 1 });
+  });
+});
+
+describe('parseDocumentStructure suggestions', () => {
+  it('reports a suggested edit to the text inside a table cell on the table', () => {
+    const cellText = { startIndex: 4, endIndex: 7, paragraph: { elements: [{ startIndex: 4, endIndex: 7, textRun: { content: 'ab\n', suggestedInsertionIds: ['suggest.cell'] } }] } };
+    const table = { startIndex: 2, endIndex: 9, table: { rows: 1, columns: 1, tableRows: [{ tableCells: [{ content: [cellText] }] }] } };
+    expect(parseDocumentStructure([table]).elements[0].suggestions).toEqual([{ id: 'suggest.cell', kind: 'insertion' }]);
+  });
+
+  it('reports suggestions on every kind of paragraph element, not only text runs', () => {
+    const p = { startIndex: 1, endIndex: 4, paragraph: { elements: [
+      { startIndex: 1, endIndex: 2, horizontalRule: { suggestedInsertionIds: ['suggest.rule'] } },
+      { startIndex: 2, endIndex: 3, richLink: { suggestedDeletionIds: ['suggest.chip'] } },
+      { startIndex: 3, endIndex: 4, textRun: { content: '\n' } },
+    ] } };
+    expect(parseDocumentStructure([p]).elements[0].suggestions).toEqual([
+      { id: 'suggest.rule', kind: 'insertion' },
+      { id: 'suggest.chip', kind: 'deletion' },
+    ]);
+  });
+});
+
+describe('parseDocumentStructure suggestions on breaks', () => {
+  it('reports a suggested section break and a suggestion inside a table of contents', () => {
+    const { elements } = parseDocumentStructure([
+      { startIndex: 0, endIndex: 1, sectionBreak: { suggestedInsertionIds: ['suggest.sec'] } },
+      { startIndex: 1, endIndex: 9, tableOfContents: { content: [paragraph('Intro\n', { startIndex: 2, endIndex: 8 })], suggestedDeletionIds: ['suggest.toc'] } },
+    ]);
+    expect(elements[0].suggestions).toEqual([{ id: 'suggest.sec', kind: 'insertion' }]);
+    expect(elements[1].suggestions).toEqual([{ id: 'suggest.toc', kind: 'deletion' }]);
   });
 });

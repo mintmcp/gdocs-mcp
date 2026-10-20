@@ -1,5 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { GoogleDocsTools } from "./tools.js";
+import { TOOL_DEFINITIONS } from "./tools.js";
 import { isToolGranted } from "./scopes.js";
 import { log, truncate } from "./lib/log.js";
 
@@ -8,13 +8,13 @@ const SERVER_VERSION = "0.1.0";
 
 // Built once: createServer runs per request, and rebuilding every Zod shape
 // each time would put that cost on every call
-const TOOLS = Object.entries(GoogleDocsTools.getTools()) as Array<[string, any]>;
+const TOOLS = Object.entries(TOOL_DEFINITIONS);
 
 export function logToolSurface(granted: Set<string> | null): void {
   const registered: string[] = [];
   const skipped: string[] = [];
   for (const [toolName, t] of TOOLS) {
-    (isToolGranted(t.handler?.scope, granted) ? registered : skipped).push(toolName);
+    (isToolGranted(t.scope, granted) ? registered : skipped).push(toolName);
   }
 
   log("info", "tool_surface", {
@@ -24,12 +24,7 @@ export function logToolSurface(granted: Set<string> | null): void {
   });
 }
 
-// Handlers return failures as isError results, so without this a failed call
-// leaves no trace in the server logs. Only fields that can't hold user data are
-// logged; the full message already went back to the client in the tool result.
-// This is a copy: gdrive, gslides, gsheets, gdocs and gmail carry the same code
-// so they log the same fields. gslides-mcp src/server.ts is the reference;
-// change it there first, then copy it to the other four
+// Failures come back as isError results, so log them, keeping only fields that can't hold user data
 export function logToolErrors(
   toolName: string,
   handler: (args: any) => Promise<any>,
@@ -55,12 +50,7 @@ export function logToolErrors(
   };
 }
 
-// reason and code are identifiers such as notFound, permission_denied or
-// TypeError. Each connector fills in only some of them, and anything that
-// isn't an identifier is dropped rather than logged. They are NOT normalized
-// across connectors: gslides and gsheets send their own codes (not_found),
-// gmail and gdocs send Google's status enum (INVALID_ARGUMENT, NOT_FOUND), and
-// gdrive sends Google's reason (notFound) as reason. Compare within a connector
+// Codes are not normalised across connectors, so compare within this one
 const IDENTIFIER = /^[A-Za-z][A-Za-z0-9_]{0,63}$/;
 
 function errorCodes(result: any): { status?: number; reason?: string; code?: string } {
@@ -82,7 +72,7 @@ export function createServer(granted: Set<string> | null): McpServer {
   const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
   for (const [toolName, t] of TOOLS) {
-    if (!isToolGranted(t.handler?.scope, granted)) continue;
+    if (!isToolGranted(t.scope, granted)) continue;
 
     server.registerTool(
       toolName,

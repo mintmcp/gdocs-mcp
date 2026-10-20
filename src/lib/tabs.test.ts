@@ -1,47 +1,39 @@
 import { describe, expect, it } from 'vitest';
-import { parseDocumentStructure } from './docs-structure.js';
+import { renderBodyText } from './docs-structure.js';
 import {
   collectInlineObjects,
-  docLocation,
-  docRange,
-  endOfBodyIndex,
-  renderStructureText,
   resolveTab,
+  summarizeTabs,
   tabsCriteriaFor,
   unknownTabError,
 } from './tabs.js';
-
-const para = (text: string, startIndex: number, endIndex: number) => ({
-  startIndex,
-  endIndex,
-  paragraph: { elements: [{ startIndex, endIndex, textRun: { content: text } }] },
-});
+import { paragraph } from "./__fixtures__/index.js";
 
 const tabbedDoc = {
   tabs: [
     {
       tabProperties: { tabId: 't.0', title: 'First', index: 0 },
       documentTab: {
-        body: { content: [para('alpha\n', 1, 7)] },
+        body: { content: [paragraph('alpha\n', 1)] },
         inlineObjects: { 'kix.a': { marker: 1 } },
       },
       childTabs: [
         {
           tabProperties: { tabId: 't.child', title: 'Nested', index: 0, nestingLevel: 1 },
-          documentTab: { body: { content: [para('nested\n', 1, 8)] } },
+          documentTab: { body: { content: [paragraph('nested\n', 1)] } },
         },
       ],
     },
     {
       tabProperties: { tabId: 't.1', title: 'Second', index: 1 },
-      documentTab: { body: { content: [para('beta\n', 1, 6)] } },
+      documentTab: { body: { content: [paragraph('beta\n', 1)] } },
     },
   ],
 };
 
 describe('resolveTab', () => {
   it('returns the root body with no tabId for untabbed documents', () => {
-    const doc = { body: { content: [para('hi\n', 1, 4)] }, inlineObjects: { 'kix.x': {} } };
+    const doc = { body: { content: [paragraph('hi\n', 1)] }, inlineObjects: { 'kix.x': {} } };
     const resolved = resolveTab(doc);
     expect(resolved.tabId).toBeUndefined();
     expect(resolved.body).toHaveLength(1);
@@ -93,53 +85,27 @@ describe('resolveTab', () => {
   });
 });
 
-describe('docLocation / docRange', () => {
-  it('omits tabId entirely when not targeting a tab', () => {
-    expect(docLocation(5)).toEqual({ index: 5 });
-    expect(docRange(1, 9)).toEqual({ startIndex: 1, endIndex: 9 });
+describe('renderBodyText', () => {
+  const table = (rows: string[][]) => ({
+    startIndex: 5, endIndex: 20,
+    table: { tableRows: rows.map((row) => ({ tableCells: row.map((text) => ({ content: [paragraph(`${text}\n`, 0)] })) })) },
   });
 
-  it('carries tabId when targeting a tab', () => {
-    expect(docLocation(5, 't.1')).toEqual({ index: 5, tabId: 't.1' });
-    expect(docRange(1, 9, 't.1')).toEqual({ startIndex: 1, endIndex: 9, tabId: 't.1' });
-  });
-});
-
-describe('endOfBodyIndex', () => {
-  it('returns one before the final endIndex', () => {
-    expect(endOfBodyIndex([para('a\n', 1, 3), para('b\n', 3, 5)])).toBe(4);
-  });
-
-  it('never goes below the body start sentinel', () => {
-    expect(endOfBodyIndex([{ endIndex: 1 }])).toBe(1);
-  });
-
-  it('throws on an empty body instead of crashing', () => {
-    expect(() => endOfBodyIndex([])).toThrow(/empty or unreadable/);
-  });
-});
-
-describe('renderStructureText', () => {
   it('concatenates paragraph text', () => {
-    const parsed = parseDocumentStructure([para('one\n', 1, 5), para('two\n', 5, 9)]);
-    expect(renderStructureText(parsed.elements)).toBe('one\ntwo\n');
+    expect(renderBodyText([paragraph('one\n', 1), paragraph('two\n', 5)])).toBe('one\ntwo\n');
   });
 
   it('renders tables as tab-separated rows', () => {
-    const text = renderStructureText([
-      { type: 'paragraph', startIndex: 1, endIndex: 5, text: 'hi\n' },
-      { type: 'table', startIndex: 5, endIndex: 20, cells: [['a', 'b'], ['c', 'd']] },
-    ]);
-    expect(text).toBe('hi\na\tb\nc\td\n');
+    expect(renderBodyText([paragraph('hi\n', 1), table([['a', 'b'], ['c', 'd']])])).toBe('hi\na\tb\nc\td\n');
   });
 
-  it('skips non-text elements', () => {
-    const text = renderStructureText([
-      { type: 'sectionBreak', startIndex: 0, endIndex: 1 },
-      { type: 'inlineImage', startIndex: 3, endIndex: 4 },
-      { type: 'paragraph', startIndex: 1, endIndex: 5, text: 'x\n' },
-    ]);
-    expect(text).toBe('x\n');
+  it('keeps every character of a long cell, which the structure caps', () => {
+    const long = 'x'.repeat(5000);
+    expect(renderBodyText([table([[long]])])).toBe(`${long}\n`);
+  });
+
+  it('skips a section break', () => {
+    expect(renderBodyText([{ startIndex: 0, endIndex: 1, sectionBreak: {} }, paragraph('x\n', 1)])).toBe('x\n');
   });
 });
 
@@ -154,6 +120,12 @@ describe('collectInlineObjects', () => {
 
   it('returns an empty object for a doc without images', () => {
     expect(collectInlineObjects({})).toEqual({});
+  });
+
+  it('keeps to one tab when given its id, and refuses an unknown one', () => {
+    expect(Object.keys(collectInlineObjects(tabbedDoc, 't.0'))).toEqual(['kix.a']);
+    expect(collectInlineObjects(tabbedDoc, 't.1')).toEqual({});
+    expect(() => collectInlineObjects(tabbedDoc, 't.nope')).toThrow(/No tab with id/);
   });
 });
 
@@ -185,5 +157,40 @@ describe('tabsCriteriaFor', () => {
 
   it('lists the available tabs for an unknown tab_id', () => {
     expect(() => tabsCriteriaFor(tabs, 't.nope')).toThrow(/t\.0 \(One\).*t\.1 \(Two\)/);
+  });
+});
+
+describe('summarizeTabs', () => {
+  it('returns an empty array for missing / empty tabs', () => {
+    expect(summarizeTabs(undefined)).toEqual([]);
+    expect(summarizeTabs([])).toEqual([]);
+  });
+
+  it('flattens nested childTabs in pre-order with depth-derived nestingLevel fallback', () => {
+    const tabs = [
+      {
+        tabProperties: { tabId: 'root', title: 'Root', index: 0 },
+        childTabs: [
+          { tabProperties: { tabId: 'child', title: 'Child', index: 0 } },
+        ],
+      },
+      { tabProperties: { tabId: 'sibling', title: 'Sibling', index: 1, nestingLevel: 0 } },
+    ];
+    const out = summarizeTabs(tabs);
+    expect(out.map((t) => t.tabId)).toEqual(['root', 'child', 'sibling']);
+    // root: no provided nestingLevel -> falls back to depth (0).
+    expect(out[0].nestingLevel).toBe(0);
+    // child: no provided nestingLevel -> falls back to depth (1).
+    expect(out[1].nestingLevel).toBe(1);
+    // sibling: explicit nestingLevel preserved.
+    expect(out[2].nestingLevel).toBe(0);
+  });
+
+  it('skips tabs without a tabId', () => {
+    const tabs = [
+      { tabProperties: { title: 'No id' } },
+      { tabProperties: { tabId: 'has-id' } },
+    ];
+    expect(summarizeTabs(tabs).map((t) => t.tabId)).toEqual(['has-id']);
   });
 });

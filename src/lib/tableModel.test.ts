@@ -1,19 +1,18 @@
 import { describe, it, expect } from 'vitest';
 import { parseDocumentStructure } from './docs-structure.js';
+import { buildTableInsertRequests, MAX_BORDER_WIDTH_PT, buildTableCellStyle } from './tableModel.js';
 import {
   MAX_STRUCTURE_CELL_CHARS,
   MAX_STRUCTURE_TABLE_CHARS,
   MAX_STRUCTURE_CELLS,
-  MAX_BORDER_WIDTH_PT,
-  hexToRgbColor,
-  buildTableCellStyle,
   collectCells,
   collectCellStyles,
   describeCellStyle,
   rgbToHex,
   describeTable,
   newStructureBudget,
-} from './tableModel.js';
+} from './tableRead.js';
+import { hexToRgbColor } from './docRequests.js';
 
 describe('table structure', () => {
   const cell = (text: string) => ({
@@ -268,8 +267,8 @@ describe('cell style building', () => {
     }
   });
 
-  it('returns no fields when nothing was given', () => {
-    expect(buildTableCellStyle({}).fields).toEqual([]);
+  it('refuses a style with nothing to set, naming what it accepts', () => {
+    expect(() => buildTableCellStyle({})).toThrow(/background_color, border, border_top, border_right, border_bottom, border_left, content_alignment/);
   });
 });
 
@@ -494,5 +493,58 @@ describe('describeTable and the document budget', () => {
     expect(entry.styles).toBeUndefined();
     expect(budget.tablesWithoutStyles).toBe(1);
     expect(budget.spent).toBe(false);
+  });
+});
+
+describe('buildTableInsertRequests', () => {
+  it('returns an empty array for empty input', () => {
+    expect(buildTableInsertRequests([], 10)).toEqual([]);
+    expect(buildTableInsertRequests([[]], 10)).toEqual([]);
+  });
+
+  it('emits requests in REVERSE document order so earlier inserts do not shift later indices', () => {
+    // 2 rows x 2 cols, all cells filled.
+    const requests = buildTableInsertRequests([['A', 'B'], ['C', 'D']], 1);
+    // Strictly descending insertText.location.index.
+    const indices = requests.map((r) => r.insertText.location.index);
+    const sortedDesc = [...indices].sort((a, b) => b - a);
+    expect(indices).toEqual(sortedDesc);
+    expect(requests).toHaveLength(4);
+  });
+
+  it('computes per-cell indices with the documented row+col formula', () => {
+    // tableInsertIndex=10, 1 row x 2 cols.
+    // rowIndex = 3 + 0 * 2 * 2 + 0 = 3
+    // col 0 -> 3 + 0*2 + 1 + 10 = 14
+    // col 1 -> 3 + 1*2 + 1 + 10 = 16
+    const requests = buildTableInsertRequests([['X', 'Y']], 10);
+    // Reverse order: Y first, then X.
+    expect(requests[0]).toEqual({ insertText: { text: 'Y', location: { index: 16 } } });
+    expect(requests[1]).toEqual({ insertText: { text: 'X', location: { index: 14 } } });
+  });
+
+  it('skips empty cells so no insertText is emitted for them', () => {
+    const requests = buildTableInsertRequests([['A', '', 'B']], 1);
+    const texts = requests.map((r) => r.insertText.text);
+    expect(texts).toContain('A');
+    expect(texts).toContain('B');
+    expect(texts).not.toContain('');
+    expect(requests).toHaveLength(2);
+  });
+
+  it('coerces non-string cell values via String(...)', () => {
+    // Cells *should* be strings, but defend in depth.
+    const requests = buildTableInsertRequests([[42 as any, true as any]], 1);
+    const texts = requests.map((r) => r.insertText.text);
+    expect(texts).toContain('42');
+    expect(texts).toContain('true');
+  });
+
+  it('handles a single-cell table', () => {
+    const requests = buildTableInsertRequests([['only']], 5);
+    expect(requests).toHaveLength(1);
+    expect(requests[0].insertText.text).toBe('only');
+    // rowIndex=3, col=0 -> 3 + 0 + 1 + 5 = 9
+    expect(requests[0].insertText.location.index).toBe(9);
   });
 });

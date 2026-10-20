@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { GoogleDocsTools } from './tools.js';
+import { TOOL_DEFINITIONS } from './tools.js';
 import { requestContext } from './auth.js';
 import { stubFetch, jsonResponse, LABEL_SCHEMA_BODY } from './lib/labelStubs.js';
 
@@ -10,9 +10,8 @@ const LISTED_LABEL = {
   }],
 };
 
-const tools = GoogleDocsTools.getTools() as any;
 const call = (tool: string, args: any) =>
-  requestContext.run({ accessToken: 'tok' }, () => tools[tool].handler(args));
+  requestContext.run({ accessToken: 'tok' }, () => TOOL_DEFINITIONS[tool].handler(args));
 
 describe('label enrichment on document reads', () => {
   const savedProfile = process.env.PROFILE;

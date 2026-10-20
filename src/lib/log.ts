@@ -1,4 +1,4 @@
-// Same format as the other Google connectors (gslides-mcp src/lib/log.ts): one
+// Same format as the other Google connectors: one
 // JSON object per line on stdout
 
 export type LogLevel = "info" | "warn" | "error";

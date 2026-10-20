@@ -1,10 +1,26 @@
-/** Pure helpers for Google Docs Tabs: tab resolution, tab-aware Location/Range objects, per-tab text */
+export interface TabSummary {
+  tabId: string;
+  title?: string;
+  index?: number;
+  nestingLevel?: number;
+}
 
-import {
-  summarizeTabs,
-  type StructureElement,
-  type TabSummary,
-} from './docs-structure.js';
+function flattenTabs(tabs: any[] | undefined, depth = 0): Array<{ tab: any; depth: number }> {
+  return (tabs ?? []).flatMap((tab) => [{ tab, depth }, ...flattenTabs(tab?.childTabs, depth + 1)]);
+}
+
+export function summarizeTabs(tabs: any[] | undefined): TabSummary[] {
+  return flattenTabs(tabs).flatMap(({ tab, depth }) => {
+    const props = tab?.tabProperties || {};
+    if (!props.tabId) return [];
+    return [{
+      tabId: props.tabId,
+      ...(props.title !== undefined ? { title: props.title } : {}),
+      ...(props.index !== undefined ? { index: props.index } : {}),
+      nestingLevel: props.nestingLevel ?? depth,
+    }];
+  });
+}
 
 /**
  * On tabbed documents `tabId` is always explicit (defaulting to the first tab)
@@ -14,19 +30,25 @@ import {
  */
 export interface ResolvedTab {
   tabId?: string;
+  revisionId?: string;
   title?: string;
   body: any[];
   inlineObjects: Record<string, any>;
+  documentStyle: any;
+  headers: Record<string, any>;
+  footers: Record<string, any>;
+  footnotes: Record<string, any>;
   tabs: TabSummary[];
 }
 
-function findTabNode(tabs: any[] | undefined, tabId: string): any | undefined {
-  for (const tab of tabs || []) {
-    if (tab?.tabProperties?.tabId === tabId) return tab;
-    const child = findTabNode(tab?.childTabs, tabId);
-    if (child) return child;
-  }
-  return undefined;
+function tabSegments(container: any): Pick<ResolvedTab, 'inlineObjects' | 'documentStyle' | 'headers' | 'footers' | 'footnotes'> {
+  return {
+    inlineObjects: container?.inlineObjects || {},
+    documentStyle: container?.documentStyle || {},
+    headers: container?.headers || {},
+    footers: container?.footers || {},
+    footnotes: container?.footnotes || {},
+  };
 }
 
 export function unknownTabError(tabId: string, tabs: TabSummary[]): Error {
@@ -39,27 +61,36 @@ export function unknownTabError(tabId: string, tabs: TabSummary[]): Error {
   );
 }
 
+function targetTabId(tabs: TabSummary[], tabId?: string): string | undefined {
+  if (tabs.length === 0) {
+    if (tabId) throw unknownTabError(tabId, tabs);
+    return undefined;
+  }
+  const target = tabId ?? tabs[0].tabId;
+  if (!tabs.some((t) => t.tabId === target)) throw unknownTabError(target, tabs);
+  return target;
+}
+
 /**
  * Resolve which body a read/write targets. The doc must have been fetched with
  * includeTabsContent=true, or tabbed documents arrive without their content
  */
 export function resolveTab(doc: any, tabId?: string): ResolvedTab {
   const tabs = summarizeTabs(doc?.tabs);
-
-  if (tabs.length === 0) {
-    if (tabId) throw unknownTabError(tabId, tabs);
-    return { body: doc?.body?.content || [], inlineObjects: doc?.inlineObjects || {}, tabs };
+  const target = targetTabId(tabs, tabId);
+  if (target === undefined) {
+    return { revisionId: doc?.revisionId, body: doc?.body?.content || [], ...tabSegments(doc), tabs };
   }
 
-  const target = tabId ?? tabs[0].tabId;
-  const node = findTabNode(doc.tabs, target);
+  const node = flattenTabs(doc.tabs).find(({ tab }) => tab?.tabProperties?.tabId === target)?.tab;
   if (!node) throw unknownTabError(target, tabs);
 
   return {
     tabId: target,
+    revisionId: doc.revisionId,
     title: node.tabProperties?.title,
     body: node.documentTab?.body?.content || [],
-    inlineObjects: node.documentTab?.inlineObjects || {},
+    ...tabSegments(node.documentTab),
     tabs,
   };
 }
@@ -69,64 +100,19 @@ export function resolveTab(doc: any, tabId?: string): ResolvedTab {
  * pin it to one explicit tab so replace writes where the other tools write
  */
 export function tabsCriteriaFor(tabs: TabSummary[], tabId?: string): { tabIds: string[] } | undefined {
-  if (tabs.length === 0) {
-    if (tabId) throw unknownTabError(tabId, tabs);
-    return undefined;
-  }
-  const target = tabId ?? tabs[0].tabId;
-  if (!tabs.some((t) => t.tabId === target)) throw unknownTabError(target, tabs);
-  return { tabIds: [target] };
+  const target = targetTabId(tabs, tabId);
+  return target === undefined ? undefined : { tabIds: [target] };
 }
 
-export function docLocation(index: number, tabId?: string): { index: number; tabId?: string } {
-  return { index, ...(tabId ? { tabId } : {}) };
-}
-
-export function docRange(
-  startIndex: number,
-  endIndex: number,
-  tabId?: string,
-): { startIndex: number; endIndex: number; tabId?: string } {
-  return { startIndex, endIndex, ...(tabId ? { tabId } : {}) };
-}
-
-/** End-of-body insertion index, one before the final newline sentinel */
-export function endOfBodyIndex(body: any[]): number {
-  const last = body[body.length - 1];
-  if (!last || typeof last.endIndex !== 'number') {
-    throw new Error('Document body is empty or unreadable; cannot find the end index.');
-  }
-  return Math.max(1, last.endIndex - 1);
-}
-
-/**
- * Per-tab text is rendered from the same parsed structure the editing indices
- * come from, because the Drive plain-text export cannot be scoped to a tab
- */
-export function renderStructureText(elements: StructureElement[]): string {
-  let out = '';
-  for (const el of elements) {
-    if (el.type === 'paragraph') {
-      out += el.text ?? '';
-    } else if (el.type === 'table' && el.cells) {
-      out += el.cells.map((row) => row.join('\t')).join('\n') + '\n';
-    }
-  }
-  return out;
+export function findInlineObjectTab(doc: any, objectId: string): string | undefined {
+  return flattenTabs(doc?.tabs).find(({ tab }) => tab?.documentTab?.inlineObjects?.[objectId])?.tab.tabProperties?.tabId;
 }
 
 /**
  * Tabbed documents keep inline objects per tab under documentTab.inlineObjects;
  * the root field only appears on fetches without includeTabsContent
  */
-export function collectInlineObjects(doc: any): Record<string, any> {
-  const out: Record<string, any> = { ...(doc?.inlineObjects || {}) };
-  const walk = (tabs: any[] | undefined) => {
-    for (const tab of tabs || []) {
-      Object.assign(out, tab?.documentTab?.inlineObjects || {});
-      walk(tab?.childTabs);
-    }
-  };
-  walk(doc?.tabs);
-  return out;
+export function collectInlineObjects(doc: any, tabId?: string): Record<string, any> {
+  if (tabId) return resolveTab(doc, tabId).inlineObjects;
+  return Object.assign({}, doc?.inlineObjects, ...flattenTabs(doc?.tabs).map(({ tab }) => tab?.documentTab?.inlineObjects));
 }
